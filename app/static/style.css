@@ -1,0 +1,14 @@
+:root { font-family: system-ui, sans-serif; color-scheme: light dark; }
+body { margin: 0; background: #111318; color: #e8eaf0; }
+main { max-width: 860px; margin: 0 auto; padding: 40px 20px 80px; }
+header { margin-bottom: 24px; } h1 { margin-bottom: 6px; } header p { opacity: .7; margin-top: 0; }
+.card { background: #1b1f27; border: 1px solid #303642; border-radius: 16px; padding: 20px; margin: 16px 0; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }.wide { grid-column: 1 / -1; }
+label { display: flex; flex-direction: column; gap: 7px; font-size: .92rem; }
+input, textarea { box-sizing: border-box; width: 100%; padding: 11px 12px; border-radius: 9px; border: 1px solid #414959; background: #11151c; color: inherit; }
+button, .link { border: 0; border-radius: 9px; padding: 11px 16px; cursor: pointer; font-weight: 700; }
+.primary { display: inline-block; background: #78a9ff; color: #08111f; margin-top: 15px; text-decoration: none; }
+.tab-buttons { display: flex; gap: 8px; margin-bottom: 16px; }.tab-buttons button { background: #2a303b; color: inherit; }.tab-buttons .active { background: #78a9ff; color: #08111f; }
+.tab { display: none; }.tab.active { display: block; }.hidden { display: none; }
+ul { line-height: 1.7; } .error { color: #ff9d9d; }
+@media (max-width: 650px) { .grid { grid-template-columns: 1fr; }.wide { grid-column: auto; } }
