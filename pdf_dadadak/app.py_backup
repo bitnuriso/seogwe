@@ -1,0 +1,1215 @@
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from flask import Flask, jsonify, request, send_file, render_template_string
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import RectangleObject
+from werkzeug.utils import secure_filename
+
+
+WORK_ROOT = Path.home() / "storage" / "shared" / "PDFCrop"
+IN_DIR = WORK_ROOT / "in"
+OUT_DIR = WORK_ROOT / "out"
+
+IN_DIR.mkdir(parents=True, exist_ok=True)
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+app = Flask(__name__)
+
+# 로컬 서버에서 대용량 압축파일을 올릴 수 있도록 최대 8GB
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024 * 1024
+
+
+HTML = r"""
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, viewport-fit=cover"
+  >
+
+  <title>PDF 다다다닥</title>
+
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: #111;
+      color: #eee;
+    }
+
+    header,
+    .toolbar {
+      padding: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: #181818;
+      border-bottom: 1px solid #333;
+    }
+
+    main {
+      padding: 12px;
+    }
+
+    input,
+    button,
+    select {
+      font: inherit;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #444;
+      background: #222;
+      color: #eee;
+    }
+
+    input[type="text"],
+    input[type="password"] {
+      min-width: 150px;
+      flex: 1;
+    }
+
+    input[type="file"] {
+      width: 100%;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    button.primary {
+      background: #f2f2f2;
+      color: #111;
+      font-weight: 700;
+    }
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      width: 100%;
+    }
+
+    .small {
+      width: 80px;
+    }
+
+    .meta,
+    label {
+      font-size: 13px;
+      color: #aaa;
+    }
+
+    details {
+      width: 100%;
+      background: #202020;
+      border: 1px solid #333;
+      border-radius: 12px;
+      padding: 8px 10px;
+    }
+
+    summary {
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    #stage {
+      position: relative;
+      margin: auto;
+      width: min(100%, 900px);
+      touch-action: none;
+      user-select: none;
+      overflow: hidden;
+    }
+
+    #canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: white;
+    }
+
+    #shade {
+      position: absolute;
+      pointer-events: none;
+      box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.48);
+      border: 2px solid #ffda44;
+    }
+
+    .handle {
+      position: absolute;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: #ffda44;
+      border: 2px solid #111;
+      transform: translate(-50%, -50%);
+      touch-action: none;
+    }
+
+    #status,
+    #importStatus {
+      padding: 8px 0;
+      min-height: 22px;
+      white-space: pre-wrap;
+    }
+
+    .toolbar {
+      position: sticky;
+      bottom: 0;
+      z-index: 10;
+      background: #181818;
+      border-top: 1px solid #333;
+    }
+
+    .toolbar button {
+      flex: 1;
+      min-width: 90px;
+    }
+  </style>
+</head>
+
+<body>
+<header>
+  <div class="row">
+    <strong>PDF 다다다닥</strong>
+    <span id="counter" class="meta">0 / 0</span>
+  </div>
+
+  <details open>
+    <summary>암호 압축파일 풀기</summary>
+
+    <div class="row" style="margin-top: 10px">
+      <input
+        id="archive"
+        type="file"
+        accept=".zip,.7z,.rar,.cbz,.cbr"
+      >
+    </div>
+
+    <div class="row">
+      <input
+        id="archivePassword"
+        type="password"
+        placeholder="압축 암호"
+      >
+
+      <button id="extract">
+        PDFCrop/in에 풀기
+      </button>
+    </div>
+
+    <div id="importStatus" class="meta"></div>
+  </details>
+
+  <div class="row">
+    <input
+      id="title"
+      type="text"
+      placeholder="기본 제목"
+      value="스캔본"
+    >
+
+    <input
+      id="number"
+      class="small"
+      type="number"
+      min="0"
+      value="1"
+    >
+
+    <select id="digits">
+      <option value="2">2자리</option>
+      <option value="3" selected>3자리</option>
+      <option value="4">4자리</option>
+    </select>
+  </div>
+
+  <div class="row">
+    <label>
+      <input id="keepCrop" type="checkbox" checked>
+      크롭 유지
+    </label>
+
+    <label>
+      <input id="allPages" type="checkbox" checked>
+      전체 페이지 적용
+    </label>
+
+    <label>
+      <input id="deleteSource" type="checkbox" checked>
+        저장 후 원본 삭제
+    </label>
+  </div>
+</header>
+
+<main>
+  <div id="original" class="meta">
+    in 폴더를 읽는 중…
+  </div>
+
+  <div id="stage">
+    <canvas id="canvas"></canvas>
+
+    <div id="shade"></div>
+
+    <div class="handle" data-corner="tl"></div>
+    <div class="handle" data-corner="tr"></div>
+    <div class="handle" data-corner="bl"></div>
+    <div class="handle" data-corner="br"></div>
+  </div>
+
+  <div id="status"></div>
+</main>
+
+<div class="toolbar">
+  <button id="prev">이전</button>
+  <button id="reset">전체 영역</button>
+  <button id="skip">건너뛰기</button>
+  <button id="save" class="primary">저장하고 다음</button>
+</div>
+
+
+<script type="module">
+import * as pdfjsLib
+  from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
+
+
+let files = [];
+let index = 0;
+
+let crop = {
+  x0: 0.03,
+  y0: 0.03,
+  x1: 0.97,
+  y1: 0.97
+};
+
+let dragging = null;
+
+const $ = id => document.getElementById(id);
+
+const stage = $("stage");
+const canvas = $("canvas");
+const context = canvas.getContext("2d");
+const shade = $("shade");
+
+const handles = [
+  ...document.querySelectorAll(".handle")
+];
+
+
+function clamp(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
+
+function safeTitle(value) {
+  return value
+    .replace(/[\\/:*?"<>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+
+function outputName() {
+  const title = safeTitle($("title").value) || "스캔본";
+
+  const number = String(
+    Math.max(0, Number($("number").value) || 0)
+  ).padStart(
+    Number($("digits").value),
+    "0"
+  );
+
+  return `${title}_${number}.pdf`;
+}
+
+function titleFromFilename(filename) {
+  return filename
+      .replace(/\.pdf$/i, "")
+      .replace(/[_\-\s]*(?:19|20)\d{6,12}$/g, "")
+      .replace(/[_\-\s]*\d+$/g, "")
+      .replace(/[_\-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+}
+
+
+function renderCrop() {
+  const width = stage.clientWidth;
+  const height = canvas.getBoundingClientRect().height;
+
+  if (!width || !height) {
+    return;
+  }
+
+  const left = crop.x0 * width;
+  const top = crop.y0 * height;
+  const right = crop.x1 * width;
+  const bottom = crop.y1 * height;
+
+  Object.assign(shade.style, {
+    left: `${left}px`,
+    top: `${top}px`,
+    right: `${width - right}px`,
+    bottom: `${height - bottom}px`
+  });
+
+  const points = {
+    tl: [left, top],
+    tr: [right, top],
+    bl: [left, bottom],
+    br: [right, bottom]
+  };
+
+  handles.forEach(handle => {
+    const [x, y] = points[handle.dataset.corner];
+
+    handle.style.left = `${x}px`;
+    handle.style.top = `${y}px`;
+  });
+}
+
+
+function eventPoint(event) {
+  const rect = stage.getBoundingClientRect();
+  const canvasHeight = canvas.getBoundingClientRect().height;
+
+  return {
+    x: clamp(
+      (event.clientX - rect.left) / rect.width,
+      0,
+      1
+    ),
+
+    y: clamp(
+      (event.clientY - rect.top) / canvasHeight,
+      0,
+      1
+    )
+  };
+}
+
+
+handles.forEach(handle => {
+  handle.addEventListener("pointerdown", event => {
+    dragging = handle.dataset.corner;
+
+    handle.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+
+  handle.addEventListener("pointermove", event => {
+    if (!dragging) {
+      return;
+    }
+
+    const point = eventPoint(event);
+    const minimumGap = 0.01;
+
+    if (dragging.includes("l")) {
+      crop.x0 = clamp(
+        point.x,
+        0,
+        crop.x1 - minimumGap
+      );
+    }
+
+    if (dragging.includes("r")) {
+      crop.x1 = clamp(
+        point.x,
+        crop.x0 + minimumGap,
+        1
+      );
+    }
+
+    if (dragging.includes("t")) {
+      crop.y0 = clamp(
+        point.y,
+        0,
+        crop.y1 - minimumGap
+      );
+    }
+
+    if (dragging.includes("b")) {
+      crop.y1 = clamp(
+        point.y,
+        crop.y0 + minimumGap,
+        1
+      );
+    }
+
+    renderCrop();
+  });
+
+  handle.addEventListener("pointerup", () => {
+    dragging = null;
+  });
+
+  handle.addEventListener("pointercancel", () => {
+    dragging = null;
+  });
+});
+
+
+window.addEventListener("resize", renderCrop);
+
+
+async function drawPreview() {
+  if (!files.length) {
+    return;
+  }
+
+  $("status").textContent = "미리보기 불러오는 중…";
+
+  const url =
+    `/api/pdf?name=${encodeURIComponent(files[index])}` +
+    `&t=${Date.now()}`;
+
+  const pdf = await pdfjsLib.getDocument(url).promise;
+  const page = await pdf.getPage(1);
+
+  const originalViewport = page.getViewport({
+    scale: 1
+  });
+
+  const cssWidth = Math.min(
+    window.innerWidth - 24,
+    900
+  );
+
+  const deviceScale = Math.min(
+    window.devicePixelRatio || 1,
+    2
+  );
+
+  const scale =
+    (cssWidth / originalViewport.width) *
+    deviceScale;
+
+  const viewport = page.getViewport({
+    scale
+  });
+
+  canvas.width = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+
+  canvas.style.width =
+    `${viewport.width / deviceScale}px`;
+
+  canvas.style.height =
+    `${viewport.height / deviceScale}px`;
+
+  await page.render({
+    canvasContext: context,
+    viewport
+  }).promise;
+
+  renderCrop();
+
+  $("status").textContent =
+    `저장 이름: ${outputName()}`;
+}
+
+
+
+async function loadFiles() {
+  const response = await fetch("/api/files");
+  const data = await response.json();
+
+  files = data.files;
+
+  index = clamp(
+        index,
+        0,
+        Math.max(0, files.length - 1)
+        );
+
+  if (files.length > 0 && (!$("title").value || $("title").value === "스캔본")) {
+        const guessedTitle = titleFromFilename(files[0]);
+
+        if (guessedTitle) { 
+
+            $("title").value = guessedTitle;
+            
+            }                                           
+        }
+                                                        showCurrent();
+
+  }
+
+
+
+function showCurrent() {
+    const hasFile =
+    files.length > 0 &&
+    index < files.length;
+
+  $("counter").textContent =
+    hasFile
+      ? `${index + 1} / ${files.length}`
+      : "0 / 0";
+
+  $("original").textContent =
+    hasFile
+      ? `원본: ${files[index]}`
+      : "in 폴더에 PDF가 없습니다.";
+
+  $("save").disabled = !hasFile;
+  $("skip").disabled = !hasFile;
+  $("prev").disabled = !hasFile;
+
+  if (hasFile) {
+    drawPreview().catch(error => {
+      $("status").textContent =
+        `미리보기 실패: ${error.message}`;
+    });
+  } else {
+    context.clearRect(
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+
+
+    canvas.width = 0;
+    canvas.height = 0;
+
+    crop = { x0: 0.03,
+             y0: 0.03,
+             x1: 0.97,
+             y1: 0.97 };
+
+    $("title").value = "";
+    $("number").value = 1;
+
+    $("original").textContent = "작업이 모두 끝났습니다.";
+
+    $("status").textContent = "새 압축파일을 올리면 다시 시작됩니다.";  
+
+  }
+}
+
+
+["title", "number", "digits"].forEach(id => {
+  $(id).addEventListener("input", () => {
+    if (files.length) {
+      $("status").textContent =
+        `저장 이름: ${outputName()}`;
+    }
+  });
+});
+
+
+$("reset").onclick = () => {
+  crop = {
+    x0: 0,
+    y0: 0,
+    x1: 1,
+    y1: 1
+  };
+
+  renderCrop();
+};
+
+
+$("prev").onclick = () => {
+  if (index > 0) {
+    index -= 1;
+    showCurrent();
+  }
+};
+
+
+$("skip").onclick = () => {
+  if (index < files.length - 1) {
+    index += 1;
+
+    if (!$("keepCrop").checked) {
+      crop = {
+        x0: 0.03,
+        y0: 0.03,
+        x1: 0.97,
+        y1: 0.97
+      };
+    }
+
+    showCurrent();
+  } else {
+    $("status").textContent =
+      "마지막 파일입니다.";
+  }
+};
+
+
+$("extract").onclick = async () => {
+  const archive = $("archive").files[0];
+
+  if (!archive) {
+    $("importStatus").textContent =
+      "압축파일을 먼저 선택하세요.";
+
+    return;
+  }
+
+  const formData = new FormData();
+
+  formData.append("archive", archive);
+  formData.append(
+    "password",
+    $("archivePassword").value
+  );
+
+  $("extract").disabled = true;
+
+  $("importStatus").textContent =
+    `업로드·압축 해제 중…\n${archive.name}`;
+
+  try {
+    const response = await fetch(
+      "/api/extract",
+      {
+        method: "POST",
+        body: formData
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        data.error || "압축 해제 실패"
+      );
+    }
+
+    let result =
+      `완료: PDF ${data.imported}개 추가`;
+
+    if (data.renamed) {
+      result +=
+        `, 중복명 ${data.renamed}개 변경`;
+    }
+
+    $("importStatus").textContent = result;
+
+    $("archive").value = "";
+    $("archivePassword").value = "";
+
+    $("title").value = "";
+    $("number").value = 1;
+
+    await loadFiles();
+  } catch (error) {
+    $("importStatus").textContent =
+      `실패: ${error.message}`;
+  } finally {
+    $("extract").disabled = false;
+  }
+};
+
+
+$("save").onclick = async () => {
+  if (!files.length) {
+    return;
+  }
+
+  $("save").disabled = true;
+  $("status").textContent = "저장 중…";
+
+  try {
+    const response = await fetch(
+      "/api/crop",
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type": "application/json"
+        },
+
+        body: JSON.stringify({
+          name: files[index],
+          output_name: outputName(),
+          crop,
+          all_pages: $("allPages").checked
+        })
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        data.error || "알 수 없는 오류"
+      );
+    }
+
+    $("number").value =
+      Number($("number").value || 0) + 1;
+
+    files.splice(index, 1);
+
+    if (index >= files.length) {
+      index = Math.max(
+        0,
+        files.length - 1
+      );
+    }
+
+    if (!$("keepCrop").checked) {
+      crop = {
+        x0: 0.03,
+        y0: 0.03,
+        x1: 0.97,
+        y1: 0.97
+      };
+    }
+
+    $("status").textContent =
+      `저장 완료: ${data.output_name}`;
+
+    setTimeout(showCurrent, 250);
+  } catch (error) {
+    $("status").textContent =
+      `실패: ${error.message}`;
+
+    $("save").disabled = false;
+  }
+};
+
+
+loadFiles();
+</script>
+</body>
+</html>
+"""
+
+
+def list_pdfs() -> list[str]:
+    return sorted(
+        (
+            path.name
+            for path in IN_DIR.iterdir()
+            if path.is_file()
+            and path.suffix.lower() == ".pdf"
+        ),
+        key=str.casefold,
+    )
+
+
+def safe_input_path(name: str) -> Path:
+    if Path(name).name != name:
+        raise ValueError("잘못된 파일명입니다.")
+
+    path = IN_DIR / name
+
+    if (
+        not path.is_file()
+        or path.suffix.lower() != ".pdf"
+    ):
+        raise FileNotFoundError(
+            "PDF를 찾을 수 없습니다."
+        )
+
+    return path
+
+
+def clean_filename(
+    name: str,
+    fallback: str = "파일",
+) -> str:
+    stem = Path(Path(name).name).stem
+
+    stem = re.sub(
+        r'[\\/:*?"<>|\x00-\x1f]+',
+        " ",
+        stem,
+    )
+
+    stem = re.sub(
+        r"\s+",
+        " ",
+        stem,
+    ).strip(" .")
+
+    return stem or fallback
+
+
+def unique_path(
+    directory: Path,
+    filename: str,
+) -> tuple[Path, bool]:
+    base = clean_filename(
+        filename,
+        "스캔본",
+    )
+
+    suffix = (
+        Path(filename).suffix.lower()
+        or ".pdf"
+    )
+
+    target = directory / f"{base}{suffix}"
+
+    if not target.exists():
+        return target, False
+
+    number = 2
+
+    while True:
+        candidate = (
+            directory
+            / f"{base}_{number}{suffix}"
+        )
+
+        if not candidate.exists():
+            return candidate, True
+
+        number += 1
+
+
+def sevenzip_binary() -> str:
+    for command in ("7zz", "7z"):
+        found = shutil.which(command)
+
+        if found:
+            return found
+
+    raise RuntimeError(
+        "7-Zip이 없습니다. "
+        "Termux에서 `pkg install 7zip`을 실행하세요."
+    )
+
+
+@app.get("/")
+def home():
+    return render_template_string(HTML)
+
+
+@app.get("/api/files")
+def api_files():
+    return jsonify(
+        files=list_pdfs(),
+        input_directory=str(IN_DIR),
+        output_directory=str(OUT_DIR),
+    )
+
+
+@app.get("/api/pdf")
+def api_pdf():
+    try:
+        path = safe_input_path(
+            request.args.get("name", "")
+        )
+
+        return send_file(
+            path,
+            mimetype="application/pdf",
+            conditional=True,
+        )
+
+    except Exception as error:
+        return jsonify(
+            error=str(error)
+        ), 400
+
+
+@app.post("/api/extract")
+def api_extract():
+    upload = request.files.get("archive")
+
+    if (
+        not upload
+        or not upload.filename
+    ):
+        return jsonify(
+            error="압축파일이 없습니다."
+        ), 400
+
+    password = request.form.get(
+        "password",
+        "",
+    )
+
+    original_name = (
+        secure_filename(upload.filename)
+        or "archive.bin"
+    )
+
+    try:
+        sevenzip = sevenzip_binary()
+
+        with tempfile.TemporaryDirectory(
+            prefix="pdfcrop_"
+        ) as temporary_directory:
+            temporary_path = Path(
+                temporary_directory
+            )
+
+            archive_path = (
+                temporary_path
+                / original_name
+            )
+
+            extract_directory = (
+                temporary_path
+                / "extracted"
+            )
+
+            extract_directory.mkdir()
+
+            upload.save(archive_path)
+
+            command = [
+                sevenzip,
+                "x",
+                str(archive_path),
+                f"-o{extract_directory}",
+                "-y",
+            ]
+
+            if password:
+                command.append(
+                    f"-p{password}"
+                )
+            else:
+                # 암호 질의창이 뜨지 않도록 빈 암호 전달
+                command.append("-p")
+
+            process = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=1800,
+            )
+
+            if process.returncode != 0:
+                output_tail = "\n".join(
+                    process.stdout
+                    .splitlines()[-8:]
+                )
+
+                raise ValueError(
+                    "암호가 틀렸거나 지원하지 않는 "
+                    "압축파일입니다.\n"
+                    + output_tail
+                )
+
+            imported = 0
+            renamed = 0
+
+            for source in sorted(
+                extract_directory.rglob("*")
+            ):
+                if (
+                    not source.is_file()
+                    or source.suffix.lower()
+                    != ".pdf"
+                ):
+                    continue
+
+                destination, was_renamed = (
+                    unique_path(
+                        IN_DIR,
+                        source.name,
+                    )
+                )
+
+                shutil.copy2(
+                    source,
+                    destination,
+                )
+
+                imported += 1
+                renamed += int(was_renamed)
+
+            if imported == 0:
+                raise ValueError(
+                    "압축파일 안에서 PDF를 "
+                    "찾지 못했습니다."
+                )
+
+            return jsonify(
+                ok=True,
+                imported=imported,
+                renamed=renamed,
+            )
+
+    except subprocess.TimeoutExpired:
+        return jsonify(
+            error=(
+                "압축 해제 시간이 너무 오래 "
+                "걸려 중단했습니다."
+            )
+        ), 408
+
+    except Exception as error:
+        return jsonify(
+            error=str(error)
+        ), 400
+
+
+@app.post("/api/crop")
+def api_crop():
+    try:
+        body: dict[str, Any] = (
+            request.get_json(force=True)
+        )
+
+        source = safe_input_path(
+            str(body.get("name", ""))
+        )
+
+        requested_output_name = str(
+            body.get(
+                "output_name",
+                "스캔본.pdf",
+            )
+        )
+
+        output_stem = clean_filename(
+            requested_output_name,
+            "스캔본",
+        )
+
+        destination, _ = unique_path(
+            OUT_DIR,
+            f"{output_stem}.pdf",
+        )
+
+        crop_data = body.get("crop") or {}
+
+        x0 = float(crop_data["x0"])
+        y0 = float(crop_data["y0"])
+        x1 = float(crop_data["x1"])
+        y1 = float(crop_data["y1"])
+
+        if not (
+            0 <= x0 < x1 <= 1
+            and 0 <= y0 < y1 <= 1
+        ):
+            raise ValueError(
+                "크롭 좌표가 올바르지 않습니다."
+            )
+
+        reader = PdfReader(str(source))
+        writer = PdfWriter()
+
+        apply_all_pages = bool(
+            body.get("all_pages", True)
+        )
+
+        for page_index, page in enumerate(
+            reader.pages
+        ):
+            if (
+                apply_all_pages
+                or page_index == 0
+            ):
+                media_box = page.mediabox
+
+                left = float(media_box.left)
+                bottom = float(media_box.bottom)
+                right = float(media_box.right)
+                top = float(media_box.top)
+
+                width = right - left
+                height = top - bottom
+
+                # 브라우저 좌표:
+                # 왼쪽 위가 원점이며 아래로 갈수록 y 증가
+                #
+                # PDF 좌표:
+                # 왼쪽 아래가 원점이며 위로 갈수록 y 증가
+                new_left = left + width * x0
+                new_right = left + width * x1
+                new_top = top - height * y0
+                new_bottom = top - height * y1
+
+                page.cropbox = RectangleObject(
+                    (
+                        new_left,
+                        new_bottom,
+                        new_right,
+                        new_top,
+                    )
+                )
+
+            writer.add_page(page)
+
+        with destination.open("wb") as output:
+            writer.write(output)
+
+        source.unlink(missing_ok=True)
+
+
+        return jsonify(
+            ok=True,
+            output_name=destination.name,
+        )
+
+    except Exception as error:
+        return jsonify(
+            error=str(error)
+        ), 400
+
+
+@app.errorhandler(413)
+def file_too_large(_error):
+    return jsonify(
+        error=(
+            "압축파일이 서버 제한보다 큽니다. "
+            "현재 제한은 8GB입니다."
+        )
+    ), 413
+
+
+if __name__ == "__main__":
+    print()
+    print(f"입력 폴더: {IN_DIR}")
+    print(f"출력 폴더: {OUT_DIR}")
+    print()
+    print(
+        "브라우저에서 "
+        "http://127.0.0.1:8000 을 여세요."
+    )
+    print()
+
+    app.run(
+        host="127.0.0.1",
+        port=8000,
+        debug=False,
+    )

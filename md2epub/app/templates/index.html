@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MD → EPUB</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<main>
+  <header><h1>MD → EPUB</h1><p>폴더·ZIP·단일 Markdown을 한 권으로 묶습니다.</p></header>
+  <section class="card grid">
+    <label>책 제목<input id="title" placeholder="비우면 자동 추출" /></label>
+    <label>저자<input id="author" placeholder="저자명" /></label>
+    <label>언어<input id="language" value="ko" /></label>
+    <label class="wide">소개<textarea id="description" rows="2"></textarea></label>
+  </section>
+
+  <section class="card tabs">
+    <div class="tab-buttons">
+      <button class="active" data-tab="path">WSL 경로</button>
+      <button data-tab="upload">ZIP / MD 업로드</button>
+    </div>
+    <div id="path" class="tab active">
+      <label>폴더 또는 MD 경로<input id="localPath" placeholder="/mnt/c/Users/me/Documents/book" /></label>
+      <button class="primary" id="buildLocal">EPUB 만들기</button>
+    </div>
+    <div id="upload" class="tab">
+      <label>ZIP 또는 MD<input type="file" id="file" accept=".zip,.md" /></label>
+      <button class="primary" id="buildUpload">EPUB 만들기</button>
+    </div>
+  </section>
+
+  <section id="status" class="card hidden"></section>
+  <section id="result" class="card hidden"><h2>구성 결과</h2><div id="tree"></div><a id="download" class="primary link" href="#">EPUB 다운로드</a></section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
