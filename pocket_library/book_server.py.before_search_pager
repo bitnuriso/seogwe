@@ -1,0 +1,1570 @@
+#!/usr/bin/env python3
+
+import argparse
+import html
+import json
+import mimetypes
+import os
+import posixpath
+import re
+import threading
+import time
+from datetime import datetime
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
+from urllib.parse import parse_qs, quote, unquote, urlsplit
+
+
+BOOK_TYPES = {
+    ".epub": ("EPUB", "application/epub+zip"),
+    ".pdf": ("PDF", "application/pdf"),
+    ".mobi": ("MOBI", "application/x-mobipocket-ebook"),
+    ".azw": ("AZW", "application/vnd.amazon.ebook"),
+    ".azw3": ("AZW3", "application/vnd.amazon.ebook"),
+    ".cbz": ("CBZ", "application/vnd.comicbook+zip"),
+    ".cbr": ("CBR", "application/vnd.comicbook-rar"),
+    ".txt": ("TXT", "text/plain; charset=utf-8"),
+    ".ttf": ("TTF", "font/ttf"),
+    ".otf": ("OTF", "font/otf"),
+    ".woff": ("WOFF", "font/woff"),
+    ".woff2": ("WOFF2", "font/woff2"),
+}
+
+TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{4,80}$")
+PROGRESS_TTL = 60 * 60
+
+
+def human_size(size):
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(size)
+
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+    return f"{size} B"
+
+
+def safe_ascii_filename(filename):
+    fallback_extension = os.path.splitext(filename)[1] or ".bin"
+
+    ascii_name = (
+        filename.encode("ascii", "ignore")
+        .decode("ascii")
+        .strip()
+        .replace('"', "_")
+        .replace("\\", "_")
+    )
+
+    if not ascii_name:
+        ascii_name = f"book{fallback_extension}"
+
+    return ascii_name
+
+
+class ProgressStore:
+    def __init__(self):
+        self._items = {}
+        self._lock = threading.Lock()
+
+    def cleanup(self):
+        cutoff = time.time() - PROGRESS_TTL
+
+        with self._lock:
+            expired = [
+                token
+                for token, item in self._items.items()
+                if item.get("updated_at", 0) < cutoff
+            ]
+
+            for token in expired:
+                self._items.pop(token, None)
+
+    def start(self, token, filename, total, start_offset=0):
+        now = time.time()
+
+        with self._lock:
+            previous = self._items.get(token, {})
+            previous_sent = int(previous.get("sent", 0))
+
+            self._items[token] = {
+                "filename": filename,
+                "total": total,
+                "sent": max(previous_sent, start_offset),
+                "status": "downloading",
+                "message": "전송 중",
+                "started_at": previous.get("started_at", now),
+                "updated_at": now,
+            }
+
+    def update(self, token, absolute_sent):
+        with self._lock:
+            item = self._items.get(token)
+
+            if not item:
+                return
+
+            item["sent"] = max(int(item.get("sent", 0)), int(absolute_sent))
+            item["status"] = "downloading"
+            item["message"] = "전송 중"
+            item["updated_at"] = time.time()
+
+    def complete(self, token):
+        with self._lock:
+            item = self._items.get(token)
+
+            if not item:
+                return
+
+            item["sent"] = int(item.get("total", item.get("sent", 0)))
+            item["status"] = "complete"
+            item["message"] = "서버 전송 완료"
+            item["updated_at"] = time.time()
+
+    def interrupt(self, token):
+        with self._lock:
+            item = self._items.get(token)
+
+            if not item:
+                return
+
+            item["status"] = "interrupted"
+            item["message"] = "연결이 끊겼습니다"
+            item["updated_at"] = time.time()
+
+    def cancel(self, token):
+        with self._lock:
+            item = self._items.get(token)
+
+            if not item:
+                return
+
+            item["status"] = "cancelled"
+            item["message"] = "사용자가 전송을 취소했습니다"
+            item["updated_at"] = time.time()
+
+    def is_cancelled(self, token):
+        with self._lock:
+            item = self._items.get(token)
+            return bool(item and item.get("status") == "cancelled")
+
+    def error(self, token, message):
+        with self._lock:
+            item = self._items.setdefault(
+                token,
+                {
+                    "filename": "",
+                    "total": 0,
+                    "sent": 0,
+                    "started_at": time.time(),
+                },
+            )
+
+            item["status"] = "error"
+            item["message"] = message
+            item["updated_at"] = time.time()
+
+    def get(self, token):
+        self.cleanup()
+
+        with self._lock:
+            item = self._items.get(token)
+
+            if not item:
+                return {
+                    "status": "waiting",
+                    "message": "다운로드 시작 대기 중",
+                    "sent": 0,
+                    "total": 0,
+                    "percent": 0,
+                }
+
+            result = dict(item)
+
+        total = int(result.get("total", 0))
+        sent = int(result.get("sent", 0))
+
+        if total > 0:
+            percent = min(100, int(sent * 100 / total))
+        else:
+            percent = 0
+
+        result["percent"] = percent
+        result["sent_text"] = human_size(sent)
+        result["total_text"] = human_size(total)
+
+        return result
+
+
+PROGRESS = ProgressStore()
+
+
+
+ALLOWED_CLIENTS = {
+    "127.0.0.1",
+    "192.168.219.122",  # 카르타
+    "192.168.219.131",    # 고7
+    "192.168.219.126",  # S25
+}
+
+class BookHandler(SimpleHTTPRequestHandler):
+
+    def is_client_allowed(self):
+        return self.client_address[0] in ALLOWED_CLIENTS
+
+    def reject_unallowed_client(self):
+        client_ip = self.client_address[0]
+
+        if self.is_client_allowed():
+            return False
+
+        print(f"[BLOCK] 허용되지 않은 접속: {client_ip}")
+
+        body = "접근이 허용되지 않은 기기입니다.\n".encode("utf-8")
+
+        self.send_response(403)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+        return True
+
+    server_version = "PocketLibrary/2.0"
+    protocol_version = "HTTP/1.1"
+
+    extensions_map = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        **{
+            extension: mime
+            for extension, (_, mime) in BOOK_TYPES.items()
+        },
+    }
+
+    def do_GET(self):
+        if self.reject_unallowed_client():
+            return
+
+        parsed = urlsplit(self.path)
+        request_path = unquote(parsed.path)
+
+        if request_path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if request_path == "/progress":
+            self.serve_progress(parsed.query)
+            return
+
+        if request_path == "/cancel":
+            self.serve_cancel(parsed.query)
+            return
+
+        if request_path.startswith("/download/"):
+            self.serve_download(request_path, parsed.query, head_only=False)
+            return
+
+        local_path = self.translate_path(parsed.path)
+
+        if os.path.isdir(local_path):
+            response = self.list_directory(local_path)
+
+            if response:
+                try:
+                    self.copyfile(response, self.wfile)
+                finally:
+                    response.close()
+            return
+
+        self.send_error(404, "파일을 찾을 수 없습니다.")
+
+    def do_HEAD(self):
+        if self.reject_unallowed_client():
+            return
+
+        parsed = urlsplit(self.path)
+        request_path = unquote(parsed.path)
+
+        if request_path.startswith("/download/"):
+            self.serve_download(request_path, parsed.query, head_only=True)
+            return
+
+        local_path = self.translate_path(parsed.path)
+
+        if os.path.isfile(local_path):
+            self.send_file_headers(local_path, head_only=True)
+            return
+
+        self.send_error(404, "파일을 찾을 수 없습니다.")
+
+    def serve_progress(self, query):
+        params = parse_qs(query)
+        token = params.get("id", [""])[0]
+
+        if not TOKEN_PATTERN.fullmatch(token):
+            self.send_json(
+                {
+                    "status": "error",
+                    "message": "잘못된 다운로드 ID",
+                    "sent": 0,
+                    "total": 0,
+                    "percent": 0,
+                },
+                status=400,
+            )
+            return
+
+        self.send_json(PROGRESS.get(token))
+
+    def serve_cancel(self, query):
+        params = parse_qs(query)
+        token = params.get("id", [""])[0]
+
+        if not TOKEN_PATTERN.fullmatch(token):
+            self.send_json(
+                {
+                    "status": "error",
+                    "message": "잘못된 다운로드 ID",
+                },
+                status=400,
+            )
+            return
+
+        PROGRESS.cancel(token)
+
+        self.send_json(
+            {
+                "status": "cancelled",
+                "message": "전송 취소 요청을 처리했습니다",
+            }
+        )
+
+    def send_json(self, payload, status=200):
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        if self.command != "HEAD":
+            self.wfile.write(encoded)
+
+    def resolve_download_path(self, request_path):
+        relative_url = request_path[len("/download/"):]
+        relative_path = unquote(relative_url).replace("\\", "/")
+
+        normalized = posixpath.normpath("/" + relative_path).lstrip("/")
+        candidate = os.path.abspath(
+            os.path.join(self.directory, *normalized.split("/"))
+        )
+        root = os.path.abspath(self.directory)
+
+        try:
+            common = os.path.commonpath((root, candidate))
+        except ValueError:
+            return None
+
+        if common != root:
+            return None
+
+        if not os.path.isfile(candidate):
+            return None
+
+        return candidate
+
+    def parse_range(self, range_header, file_size):
+        if not range_header:
+            return 0, file_size - 1, False
+
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+
+        if not match:
+            return None
+
+        start_text, end_text = match.groups()
+
+        try:
+            if start_text:
+                start = int(start_text)
+                end = int(end_text) if end_text else file_size - 1
+            else:
+                suffix_length = int(end_text)
+
+                if suffix_length <= 0:
+                    return None
+
+                start = max(0, file_size - suffix_length)
+                end = file_size - 1
+        except ValueError:
+            return None
+
+        if start < 0 or end < start or start >= file_size:
+            return None
+
+        end = min(end, file_size - 1)
+
+        return start, end, True
+
+    def serve_download(self, request_path, query, head_only=False):
+        params = parse_qs(query)
+        token = params.get("id", [""])[0]
+
+        if not TOKEN_PATTERN.fullmatch(token):
+            self.send_error(400, "잘못된 다운로드 ID")
+            return
+
+        local_path = self.resolve_download_path(request_path)
+
+        if not local_path:
+            PROGRESS.error(token, "파일을 찾을 수 없습니다")
+            self.send_error(404, "파일을 찾을 수 없습니다.")
+            return
+
+        filename = os.path.basename(local_path)
+        file_size = os.path.getsize(local_path)
+
+        range_result = self.parse_range(
+            self.headers.get("Range"),
+            file_size,
+        )
+
+        if range_result is None:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{file_size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        start, end, is_partial = range_result
+        content_length = end - start + 1
+
+        extension = os.path.splitext(filename)[1].lower()
+        content_type = BOOK_TYPES.get(
+            extension,
+            ("FILE", mimetypes.guess_type(filename)[0] or "application/octet-stream"),
+        )[1]
+
+        PROGRESS.start(
+            token,
+            filename,
+            file_size,
+            start_offset=start,
+        )
+
+        self.send_response(206 if is_partial else 200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(content_length))
+        self.send_header("Accept-Ranges", "bytes")
+
+        if is_partial:
+            self.send_header(
+                "Content-Range",
+                f"bytes {start}-{end}/{file_size}",
+            )
+
+        # 구형 Moon+가 다운로드 URL의 원래 파일명을 사용하도록
+        # Content-Disposition 헤더는 보내지 않는다.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        if head_only:
+            return
+
+        sent_this_request = 0
+        chunk_size = 128 * 1024
+
+        try:
+            with open(local_path, "rb") as source:
+                source.seek(start)
+                remaining = content_length
+
+                while remaining > 0:
+                    if PROGRESS.is_cancelled(token):
+                        print(
+                            f"[BOOK] {self.client_address[0]} "
+                            f"사용자 취소: {filename} "
+                            f"({human_size(start + sent_this_request)} / "
+                            f"{human_size(file_size)})"
+                        )
+                        return
+
+                    chunk = source.read(min(chunk_size, remaining))
+
+                    if not chunk:
+                        break
+
+                    self.wfile.write(chunk)
+                    sent_this_request += len(chunk)
+                    remaining -= len(chunk)
+
+                    PROGRESS.update(
+                        token,
+                        start + sent_this_request,
+                    )
+
+            if sent_this_request == content_length:
+                if end >= file_size - 1:
+                    PROGRESS.complete(token)
+                else:
+                    PROGRESS.update(token, end + 1)
+
+                print(
+                    f"[BOOK] {self.client_address[0]} "
+                    f"전송 완료: {filename} "
+                    f"({human_size(sent_this_request)})"
+                )
+            else:
+                PROGRESS.interrupt(token)
+
+        except (BrokenPipeError, ConnectionResetError):
+            PROGRESS.interrupt(token)
+
+            print(
+                f"[BOOK] {self.client_address[0]} "
+                f"전송 중 연결 종료: {filename} "
+                f"({human_size(start + sent_this_request)} / "
+                f"{human_size(file_size)})"
+            )
+
+        except OSError as error:
+            PROGRESS.error(token, f"전송 오류: {error}")
+
+            print(
+                f"[BOOK] 전송 오류: {filename}: {error}"
+            )
+
+    def send_file_headers(self, local_path, head_only=False):
+        filename = os.path.basename(local_path)
+        file_size = os.path.getsize(local_path)
+        extension = os.path.splitext(filename)[1].lower()
+
+        content_type = BOOK_TYPES.get(
+            extension,
+            ("FILE", mimetypes.guess_type(filename)[0] or "application/octet-stream"),
+        )[1]
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(file_size))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def list_directory(self, path):
+        try:
+            entries = sorted(
+                os.listdir(path),
+                key=lambda name: (
+                    not os.path.isdir(os.path.join(path, name)),
+                    name.casefold(),
+                ),
+            )
+        except OSError:
+            self.send_error(404, "폴더를 읽을 수 없습니다.")
+            return None
+
+        parsed = urlsplit(self.path)
+        request_path = unquote(parsed.path)
+        params = parse_qs(parsed.query)
+
+        if not request_path.endswith("/"):
+            request_path += "/"
+
+        # 보기 옵션이 없는 주소는 스크롤 모드 URL로 이동
+        if "view" not in params:
+            redirect_path = quote(request_path, safe="/")
+
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                redirect_path + "?view=page&page=1",
+            )
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return None
+
+        view_mode = params.get("view", ["scroll"])[0]
+
+        if view_mode not in ("scroll", "page"):
+            view_mode = "scroll"
+
+        try:
+            current_page = max(
+                1,
+                int(params.get("page", ["1"])[0]),
+            )
+        except (TypeError, ValueError):
+            current_page = 1
+
+        items_per_page = 5
+        display_entries = []
+
+        for entry_name in entries:
+            if entry_name.startswith("."):
+                continue
+
+            if entry_name.casefold() == "moonreader":
+                continue
+
+            entry_path = os.path.join(path, entry_name)
+
+            if os.path.isdir(entry_path):
+                display_entries.append(entry_name)
+                continue
+
+            extension = os.path.splitext(
+                entry_name
+            )[1].lower()
+
+            if extension in BOOK_TYPES:
+                display_entries.append(entry_name)
+
+        total_items = len(display_entries)
+        total_pages = max(
+            1,
+            (total_items + items_per_page - 1)
+            // items_per_page,
+        )
+
+        current_page = min(current_page, total_pages)
+
+        if view_mode == "page":
+            page_start = (
+                current_page - 1
+            ) * items_per_page
+            page_end = page_start + items_per_page
+            entries = display_entries[page_start:page_end]
+        else:
+            entries = display_entries
+
+        cards = []
+        visible_count = 0
+
+        if request_path != "/":
+            parent_path = posixpath.dirname(
+                request_path.rstrip("/")
+            ) + "/"
+
+            parent_url = (
+                quote(parent_path, safe="/")
+                + f"?view={view_mode}"
+            )
+
+            cards.append(
+                f"""
+                <a class="book-card folder-card"
+                   href="{html.escape(parent_url)}">
+                    <div class="type-icon">↩</div>
+                    <div class="book-info">
+                        <div class="book-title">상위 폴더</div>
+                        <div class="book-meta">뒤로 가기</div>
+                    </div>
+                    <div class="open-button">열기</div>
+                </a>
+                """
+            )
+
+        for name in entries:
+            if name.startswith("."):
+                continue
+
+            # Moon+ Reader가 만든 내부 폴더는 서재 목록에서 숨김
+            if name.casefold() == "moonreader":
+                continue
+
+            full_path = os.path.join(path, name)
+            encoded_name = quote(name)
+
+            if os.path.isdir(full_path):
+                folder_url = (
+                    encoded_name
+                    + "/"
+                    + f"?view={view_mode}"
+                )
+
+                cards.append(
+                    f"""
+                    <a class="book-card folder-card searchable"
+                       href="{html.escape(folder_url)}"
+                       data-name="{html.escape(name.casefold())}">
+                        <div class="type-icon">DIR</div>
+                        <div class="book-info">
+                            <div class="book-title">
+                                {html.escape(name)}
+                            </div>
+                            <div class="book-meta">폴더</div>
+                        </div>
+                        <div class="open-button">열기</div>
+                    </a>
+                    """
+                )
+
+                visible_count += 1
+                continue
+
+            extension = os.path.splitext(name)[1].lower()
+
+            if extension not in BOOK_TYPES:
+                continue
+
+            label, _ = BOOK_TYPES[extension]
+            size = os.path.getsize(full_path)
+            modified = datetime.fromtimestamp(
+                os.path.getmtime(full_path)
+            ).strftime("%Y-%m-%d %H:%M")
+
+            relative_path = posixpath.join(
+                request_path.lstrip("/"),
+                name,
+            )
+
+            download_path = "/download/" + quote(
+                relative_path,
+                safe="/",
+            )
+
+            card_id = f"book-{visible_count}"
+
+            cards.append(
+                f"""
+                <article class="book-card searchable"
+                         data-name="{html.escape(name.casefold())}">
+                    <div class="type-icon">{html.escape(label)}</div>
+
+                    <div class="book-info">
+                        <div class="book-title">
+                            {html.escape(name)}
+                        </div>
+
+                        <div class="book-meta">
+                            {html.escape(human_size(size))}
+                            · {html.escape(modified)}
+                        </div>
+
+                        <div id="{card_id}-progress"
+                             class="progress-area hidden">
+                            <div class="progress-track">
+                                <div id="{card_id}-bar"
+                                     class="progress-bar"></div>
+                            </div>
+
+                            <div class="progress-row">
+                                <span id="{card_id}-text">
+                                    다운로드 준비 중
+                                </span>
+                                <strong id="{card_id}-percent">0%</strong>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card-actions">
+                        <button class="download-button"
+                                type="button"
+                                onclick="startDownload(
+                                    '{card_id}',
+                                    '{html.escape(download_path, quote=True)}',
+                                    '{html.escape(name, quote=True)}'
+                                )">
+                            받기
+                        </button>
+
+                        <button id="{card_id}-cancel"
+                                class="cancel-button hidden"
+                                type="button"
+                                onclick="cancelDownload('{card_id}')">
+                            취소
+                        </button>
+                    </div>
+                </article>
+                """
+            )
+
+            visible_count += 1
+
+        card_html = "".join(cards)
+
+        encoded_base_path = quote(
+            request_path,
+            safe="/",
+        )
+
+        if view_mode == "scroll":
+            switch_url = (
+                encoded_base_path
+                + "?view=page&page=1"
+            )
+            switch_label = "페이지 보기"
+        else:
+            switch_url = (
+                encoded_base_path
+                + "?view=scroll"
+            )
+            switch_label = "스크롤 보기"
+
+        view_controls = f"""
+        <div class="view-controls">
+            <a class="view-button"
+               href="{switch_url}">
+                {switch_label}
+            </a>
+        </div>
+        """
+
+        pagination_html = ""
+
+        if view_mode == "page":
+            previous_page = max(
+                1,
+                current_page - 1,
+            )
+            next_page = min(
+                total_pages,
+                current_page + 1,
+            )
+
+            if current_page > 1:
+                previous_html = f"""
+                <a class="pager-button"
+                   href="{encoded_base_path}?view=page&page={previous_page}">
+                    이전
+                </a>
+                """
+            else:
+                previous_html = """
+                <span class="pager-button disabled">
+                    이전
+                </span>
+                """
+
+            if current_page < total_pages:
+                next_html = f"""
+                <a class="pager-button"
+                   href="{encoded_base_path}?view=page&page={next_page}">
+                    다음
+                </a>
+                """
+            else:
+                next_html = """
+                <span class="pager-button disabled">
+                    다음
+                </span>
+                """
+
+            pagination_html = f"""
+            <nav class="pagination">
+                {previous_html}
+
+                <span class="page-status">
+                    {current_page} / {total_pages}
+                </span>
+
+                {next_html}
+            </nav>
+            """
+
+        if not card_html:
+            card_html = (
+                '<div class="empty">이 폴더에 표시할 책이 없습니다.</div>'
+            )
+
+        body = f"""<!doctype html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1, viewport-fit=cover"
+    >
+
+    <title>내 서재</title>
+
+    <style>
+        * {{
+            box-sizing: border-box;
+        }}
+
+        html {{
+            background: #ece9e1;
+        }}
+
+        body {{
+            margin: 0;
+            color: #25231f;
+            background: #ece9e1;
+            font-family:
+                -apple-system,
+                BlinkMacSystemFont,
+                "Noto Sans KR",
+                Arial,
+                sans-serif;
+        }}
+
+        button,
+        input {{
+            font: inherit;
+        }}
+
+        .page {{
+            width: 100%;
+            max-width: 820px;
+            margin: 0 auto;
+            padding: 16px 12px 42px;
+        }}
+
+        .hero {{
+            margin-bottom: 14px;
+            padding: 20px;
+            background: #fffef9;
+            border: 1px solid #cfc9bb;
+            border-radius: 16px;
+        }}
+
+        .hero h1 {{
+            margin: 0 0 7px;
+            font-size: 25px;
+            line-height: 1.25;
+        }}
+
+        .hero-description {{
+            color: #666056;
+            font-size: 14px;
+            line-height: 1.6;
+        }}
+
+        .notice {{
+            margin-top: 13px;
+            padding: 11px 12px;
+            color: #474238;
+            background: #f1eee5;
+            border: 1px solid #ddd7ca;
+            border-radius: 10px;
+            font-size: 13px;
+            line-height: 1.55;
+        }}
+
+        .search-box {{
+            width: 100%;
+            margin: 0 0 13px;
+            padding: 13px 14px;
+            color: #222;
+            background: #fffef9;
+            border: 1px solid #c8c1b4;
+            border-radius: 12px;
+            outline: none;
+            font-size: 16px;
+        }}
+
+        .search-box:focus {{
+            border-color: #777064;
+        }}
+
+        .view-controls {{
+            margin: 0 0 13px;
+        }}
+
+        .view-button {{
+            display: block;
+            width: 100%;
+            padding: 11px 12px;
+            color: #37332d;
+            background: #fffef9;
+            border: 1px solid #aaa295;
+            border-radius: 10px;
+            text-align: center;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 700;
+        }}
+
+        .view-button:active {{
+            background: #e2ddd2;
+        }}
+
+        .pagination {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin: 13px 0;
+            padding: 10px;
+            background: #fffef9;
+            border: 1px solid #d1cabc;
+            border-radius: 11px;
+        }}
+
+        .pager-button {{
+            min-width: 68px;
+            padding: 9px 10px;
+            color: #292620;
+            background: #f1eee6;
+            border: 1px solid #999184;
+            border-radius: 8px;
+            text-align: center;
+            text-decoration: none;
+        }}
+
+        .pager-button.disabled {{
+            color: #aaa398;
+            background: #eeeae2;
+            border-color: #d3cdc1;
+        }}
+
+        .page-status {{
+            color: #555047;
+            font-size: 14px;
+            font-weight: 700;
+            white-space: nowrap;
+        }}
+
+        .book-card {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-height: 82px;
+            margin-bottom: 10px;
+            padding: 13px;
+            color: inherit;
+            background: #fffef9;
+            border: 1px solid #d1cabc;
+            border-radius: 14px;
+            text-decoration: none;
+        }}
+
+        .folder-card:active {{
+            background: #e4dfd4;
+        }}
+
+        .type-icon {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 57px;
+            min-width: 57px;
+            height: 44px;
+            padding: 4px;
+            color: #37332c;
+            border: 1px solid #918a7e;
+            border-radius: 9px;
+            font-size: 12px;
+            font-weight: 800;
+        }}
+
+        .book-info {{
+            flex: 1;
+            min-width: 0;
+        }}
+
+        .book-title {{
+            overflow-wrap: anywhere;
+            font-size: 16px;
+            font-weight: 750;
+            line-height: 1.42;
+        }}
+
+        .book-meta {{
+            margin-top: 5px;
+            color: #777065;
+            font-size: 12px;
+        }}
+
+        .card-actions {{
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }}
+
+        .download-button,
+        .cancel-button,
+        .open-button {{
+            min-width: 54px;
+            padding: 9px 10px;
+            color: #24211d;
+            background: #f1eee6;
+            border: 1px solid #999184;
+            border-radius: 9px;
+            text-align: center;
+            white-space: nowrap;
+        }}
+
+        .download-button:active,
+        .cancel-button:active {{
+            background: #dcd6ca;
+        }}
+
+        .cancel-button {{
+            min-width: 54px;
+            padding: 8px 10px;
+            color: #4d2828;
+            background: #f3e9e7;
+            border: 1px solid #a68b86;
+            border-radius: 9px;
+            text-align: center;
+            white-space: nowrap;
+        }}
+
+        .progress-area {{
+            margin-top: 11px;
+        }}
+
+        .progress-track {{
+            width: 100%;
+            height: 11px;
+            overflow: hidden;
+            background: #ddd8ce;
+            border: 1px solid #c1baad;
+            border-radius: 999px;
+        }}
+
+        .progress-bar {{
+            width: 0%;
+            height: 100%;
+            background: #4f6d58;
+            transition: width 0.25s linear;
+        }}
+
+        .progress-row {{
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            margin-top: 5px;
+            color: #686157;
+            font-size: 12px;
+            line-height: 1.4;
+        }}
+
+        .progress-row strong {{
+            color: #38342e;
+            white-space: nowrap;
+        }}
+
+        .hidden {{
+            display: none;
+        }}
+
+        .empty {{
+            padding: 34px 16px;
+            color: #777065;
+            background: #fffef9;
+            border: 1px solid #d1cabc;
+            border-radius: 14px;
+            text-align: center;
+        }}
+
+        .footer {{
+            margin-top: 18px;
+            color: #777065;
+            text-align: center;
+            font-size: 12px;
+            line-height: 1.6;
+        }}
+
+        #downloadFrame {{
+            display: none;
+            width: 0;
+            height: 0;
+            border: 0;
+        }}
+
+        @media (max-width: 480px) {{
+            .page {{
+                padding: 9px 7px 30px;
+            }}
+
+            .hero {{
+                padding: 15px;
+                border-radius: 10px;
+            }}
+
+            .book-card {{
+                gap: 9px;
+                padding: 11px 9px;
+                border-radius: 9px;
+            }}
+
+            .type-icon {{
+                width: 48px;
+                min-width: 48px;
+            }}
+
+            .download-button,
+            .open-button {{
+                min-width: 47px;
+                padding: 8px 7px;
+            }}
+        }}
+    </style>
+</head>
+
+<body>
+    <main class="page">
+        <section class="hero">
+            <h1>내 도서관</h1>
+
+            <div class="hero-description">
+                책을 누르면 폰 서버에서 리더기로 전송합니다.
+            </div>
+
+            <div class="notice">
+                게이지 100%는 서버 전송 완료를 뜻합니다.<br>
+                Moon+에서 <strong>.epub.mr</strong> 파일을
+                <strong>.epub</strong>으로 정리하는 데 시간이 더 걸릴 수 있습니다.
+            </div>
+        </section>
+
+        <input
+            id="search"
+            class="search-box"
+            type="search"
+            placeholder="책 제목 검색"
+            autocomplete="off"
+        >
+
+        {view_controls}
+
+        {pagination_html}
+
+        <section id="bookList">
+            {card_html}
+        </section>
+
+        {pagination_html}
+
+        <div class="footer">
+            표시된 항목: {visible_count}개
+            / 전체 {total_items}개<br>
+            Pocket Library · Termux
+        </div>
+
+        <iframe
+            id="downloadFrame"
+            name="downloadFrame"
+            title="download"
+        ></iframe>
+    </main>
+
+    <script>
+        (function () {{
+            var search = document.getElementById("search");
+            var cards = document.querySelectorAll(".searchable");
+
+            search.addEventListener("input", function () {{
+                var query = search.value.toLowerCase();
+
+                for (var i = 0; i < cards.length; i++) {{
+                    var name = cards[i].getAttribute("data-name") || "";
+
+                    cards[i].style.display =
+                        name.indexOf(query) !== -1 ? "flex" : "none";
+                }}
+            }});
+        }})();
+
+        var activeDownloads = {{}};
+
+        function makeToken() {{
+            return (
+                Date.now().toString(36)
+                + "-"
+                + Math.random().toString(36).slice(2, 12)
+            );
+        }}
+
+        function startDownload(cardId, downloadPath, filename) {{
+            var token = makeToken();
+            var progressBox = document.getElementById(
+                cardId + "-progress"
+            );
+            var bar = document.getElementById(cardId + "-bar");
+            var text = document.getElementById(cardId + "-text");
+            var percent = document.getElementById(
+                cardId + "-percent"
+            );
+            var frame = document.getElementById("downloadFrame");
+            var cancelButton = document.getElementById(
+                cardId + "-cancel"
+            );
+
+            activeDownloads[cardId] = token;
+            cancelButton.className = "cancel-button";
+
+            progressBox.className = "progress-area";
+            bar.style.width = "0%";
+            text.textContent = "다운로드 연결 중: " + filename;
+            percent.textContent = "0%";
+
+            frame.src =
+                downloadPath
+                + "?id="
+                + encodeURIComponent(token)
+                + "&t="
+                + Date.now();
+
+            pollProgress(
+                cardId,
+                token,
+                bar,
+                text,
+                percent,
+                0
+            );
+        }}
+
+        function cancelDownload(cardId) {{
+            var token = activeDownloads[cardId];
+
+            if (!token) {{
+                return;
+            }}
+
+            var frame = document.getElementById("downloadFrame");
+            var bar = document.getElementById(cardId + "-bar");
+            var text = document.getElementById(cardId + "-text");
+            var percent = document.getElementById(
+                cardId + "-percent"
+            );
+            var cancelButton = document.getElementById(
+                cardId + "-cancel"
+            );
+
+            var request = new XMLHttpRequest();
+
+            request.open(
+                "GET",
+                "/cancel?id="
+                    + encodeURIComponent(token)
+                    + "&t="
+                    + Date.now(),
+                true
+            );
+
+            request.send(null);
+
+            frame.src = "about:blank";
+
+            text.textContent = "사용자가 전송을 취소했습니다";
+            percent.textContent = "취소";
+            bar.style.width = "0%";
+            cancelButton.className = "cancel-button hidden";
+
+            delete activeDownloads[cardId];
+        }}
+
+        function pollProgress(
+            cardId,
+            token,
+            bar,
+            text,
+            percent,
+            misses
+        ) {{
+            var request = new XMLHttpRequest();
+
+            request.open(
+                "GET",
+                "/progress?id="
+                    + encodeURIComponent(token)
+                    + "&t="
+                    + Date.now(),
+                true
+            );
+
+            request.onreadystatechange = function () {{
+                if (request.readyState !== 4) {{
+                    return;
+                }}
+
+                if (request.status !== 200) {{
+                    if (misses < 20) {{
+                        setTimeout(function () {{
+                            pollProgress(
+                                cardId,
+                                token,
+                                bar,
+                                text,
+                                percent,
+                                misses + 1
+                            );
+                        }}, 700);
+                    }} else {{
+                        text.textContent = "진행 상태를 확인할 수 없습니다";
+                    }}
+
+                    return;
+                }}
+
+                var data;
+
+                try {{
+                    data = JSON.parse(request.responseText);
+                }} catch (error) {{
+                    text.textContent = "진행 정보 해석 오류";
+                    return;
+                }}
+
+                var value = data.percent || 0;
+
+                bar.style.width = value + "%";
+                percent.textContent = value + "%";
+
+                if (data.total > 0) {{
+                    text.textContent =
+                        data.sent_text
+                        + " / "
+                        + data.total_text
+                        + " · "
+                        + data.message;
+                }} else {{
+                    text.textContent = data.message;
+                }}
+
+                if (data.status === "complete") {{
+                    bar.style.width = "100%";
+                    percent.textContent = "100%";
+                    text.textContent =
+                        data.total_text
+                        + " · 서버 전송 완료"
+                        + " · 리더기에서 처리 중일 수 있음";
+
+                    document.getElementById(
+                        cardId + "-cancel"
+                    ).className = "cancel-button hidden";
+
+                    delete activeDownloads[cardId];
+                    return;
+                }}
+
+                if (data.status === "cancelled") {{
+                    bar.style.width = "0%";
+                    percent.textContent = "취소";
+                    text.textContent = data.message;
+
+                    document.getElementById(
+                        cardId + "-cancel"
+                    ).className = "cancel-button hidden";
+
+                    delete activeDownloads[cardId];
+                    return;
+                }}
+
+                if (data.status === "error") {{
+                    return;
+                }}
+
+                if (data.status === "interrupted") {{
+                    text.textContent =
+                        data.sent_text
+                        + " / "
+                        + data.total_text
+                        + " · 연결 끊김 또는 재시도 중";
+                }}
+
+                setTimeout(function () {{
+                    pollProgress(
+                        cardId,
+                        token,
+                        bar,
+                        text,
+                        percent,
+                        0
+                    );
+                }}, 500);
+            }};
+
+            request.send(null);
+        }}
+    </script>
+</body>
+</html>
+"""
+
+        encoded = body.encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        return BytesIO(encoded)
+
+    def log_message(self, fmt, *args):
+        print(
+            f"[BOOK] {self.client_address[0]} - {fmt % args}"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Termux 개인 전자책 서버"
+    )
+
+    parser.add_argument(
+        "--directory",
+        default=os.path.expanduser(
+            "~/storage/shared/Mine/Books"
+        ),
+    )
+    parser.add_argument("--port", type=int, default=8083)
+    parser.add_argument("--bind", default="0.0.0.0")
+
+    args = parser.parse_args()
+
+    directory = os.path.abspath(
+        os.path.expanduser(args.directory)
+    )
+
+    if not os.path.isdir(directory):
+        raise SystemExit(
+            f"[ERROR] Books 폴더가 없습니다: {directory}"
+        )
+
+    def handler_factory(*handler_args, **handler_kwargs):
+        return BookHandler(
+            *handler_args,
+            directory=directory,
+            **handler_kwargs,
+        )
+
+    server = ThreadingHTTPServer(
+        (args.bind, args.port),
+        handler_factory,
+    )
+
+    server.daemon_threads = True
+    server.allow_reuse_address = True
+
+    print(f"[BOOK] 폴더: {directory}")
+    print(f"[BOOK] 포트: {args.port}")
+    print("[BOOK] 주소: http://192.168.219.126:8083/")
+    print("[BOOK] 종료: Ctrl+C")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[BOOK] 서버 종료")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

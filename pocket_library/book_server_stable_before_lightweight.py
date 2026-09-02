@@ -1,0 +1,8186 @@
+#!/usr/bin/env python3
+
+import argparse
+import html
+import json
+import mimetypes
+import os
+import posixpath
+import re
+import threading
+import time
+from datetime import datetime
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
+from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlsplit
+import zipfile
+import xml.etree.ElementTree as ET
+
+
+
+METADATA_CACHE_DIR = Path.home() / ".bookserver"
+METADATA_CACHE_FILE = METADATA_CACHE_DIR / "metadata.json"
+METADATA_CACHE_LOCK = threading.RLock()
+
+
+def load_metadata_cache():
+    try:
+        with METADATA_CACHE_FILE.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+METADATA_CACHE = load_metadata_cache()
+
+METADATA_OVERRIDE_FILE = (
+    METADATA_CACHE_DIR / "metadata_overrides.json"
+)
+METADATA_OVERRIDE_LOCK = threading.RLock()
+
+
+def load_metadata_overrides():
+    try:
+        with METADATA_OVERRIDE_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            data = json.load(file)
+
+        return data if isinstance(data, dict) else {}
+
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+METADATA_OVERRIDES = load_metadata_overrides()
+
+
+def save_metadata_overrides():
+    METADATA_CACHE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary_file = METADATA_OVERRIDE_FILE.with_suffix(
+        ".json.tmp"
+    )
+
+    with temporary_file.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            METADATA_OVERRIDES,
+            file,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+
+    temporary_file.replace(METADATA_OVERRIDE_FILE)
+
+
+def normalize_book_tags(value):
+    if isinstance(value, str):
+        values = value.replace(
+            "\n",
+            ",",
+        ).split(",")
+
+    elif isinstance(value, (list, tuple, set)):
+        values = value
+
+    else:
+        values = []
+
+    normalized = []
+    seen = set()
+
+    for item in values:
+        tag = " ".join(
+            str(item).split()
+        ).strip()
+
+        if not tag:
+            continue
+
+        tag_key = tag.casefold()
+
+        if tag_key in seen:
+            continue
+
+        seen.add(tag_key)
+        normalized.append(tag)
+
+    return normalized
+
+
+def get_metadata_override(file_path):
+    real_path = os.path.realpath(
+        os.path.abspath(file_path)
+    )
+
+    with METADATA_OVERRIDE_LOCK:
+        entry = METADATA_OVERRIDES.get(real_path)
+
+        if not isinstance(entry, dict):
+            return None
+
+        return {
+            "title": str(entry.get("title", "")),
+            "author": str(entry.get("author", "")),
+            "language": str(entry.get("language", "")),
+            "series": str(entry.get("series", "")),
+            "series_index": str(
+                entry.get("series_index", "")
+            ),
+            "published_at": str(
+                entry.get("published_at", "")
+            ),
+            "tags": normalize_book_tags(
+                entry.get("tags", [])
+            ),
+        }
+
+
+
+def apply_metadata_override(file_path, metadata):
+    result = {
+        "title": str(metadata.get("title", "")),
+        "author": str(metadata.get("author", "")),
+        "language": str(metadata.get("language", "")),
+        "series": str(metadata.get("series", "")),
+        "series_index": str(
+            metadata.get("series_index", "")
+        ),
+        "published_at": str(
+            metadata.get("published_at", "")
+        ),
+        "tags": normalize_book_tags(
+            metadata.get("tags", [])
+        ),
+    }
+
+    override = get_metadata_override(file_path)
+
+    if override is not None:
+        result.update(override)
+
+    return result
+
+
+
+def set_metadata_override(
+    file_path,
+    title,
+    author,
+    language,
+    series="",
+    series_index="",
+    published_at="",
+    tags=None,
+):
+    real_path = os.path.realpath(
+        os.path.abspath(file_path)
+    )
+
+    title = " ".join(str(title).split()).strip()
+    author = " ".join(str(author).split()).strip()
+    language = " ".join(str(language).split()).strip()
+    series = " ".join(str(series).split()).strip()
+
+    series_index = " ".join(
+        str(series_index).split()
+    ).strip()
+
+    published_at = " ".join(
+        str(published_at).split()
+    ).strip()
+
+    tags = normalize_book_tags(tags)
+
+    if len(title) > 300:
+        raise ValueError(
+            "제목은 300자까지 입력할 수 있습니다."
+        )
+
+    if len(author) > 300:
+        raise ValueError(
+            "저자는 300자까지 입력할 수 있습니다."
+        )
+
+    if len(language) > 32:
+        raise ValueError(
+            "언어 값이 너무 깁니다."
+        )
+
+    if len(series) > 300:
+        raise ValueError(
+            "시리즈명은 300자까지 입력할 수 있습니다."
+        )
+
+    if len(series_index) > 32:
+        raise ValueError(
+            "권차 값이 너무 깁니다."
+        )
+
+    if len(published_at) > 32:
+        raise ValueError(
+            "출간일 값이 너무 깁니다."
+        )
+
+    if len(tags) > 50:
+        raise ValueError(
+            "태그는 책 한 권당 50개까지 저장할 수 있습니다."
+        )
+
+    for tag in tags:
+        if len(tag) > 80:
+            raise ValueError(
+                "태그 하나는 80자까지 입력할 수 있습니다."
+            )
+
+    if series_index:
+        try:
+            numeric_index = float(series_index)
+        except ValueError:
+            raise ValueError(
+                "권차는 숫자로 입력해주세요."
+            )
+
+        if numeric_index < 0:
+            raise ValueError(
+                "권차는 0 이상이어야 합니다."
+            )
+
+    with METADATA_OVERRIDE_LOCK:
+        METADATA_OVERRIDES[real_path] = {
+            "title": title,
+            "author": author,
+            "language": language,
+            "series": series,
+            "series_index": series_index,
+            "published_at": published_at,
+            "tags": tags,
+        }
+
+        save_metadata_overrides()
+
+    return get_metadata_override(real_path)
+
+
+
+def clear_metadata_override(file_path):
+    real_path = os.path.realpath(
+        os.path.abspath(file_path)
+    )
+
+    with METADATA_OVERRIDE_LOCK:
+        METADATA_OVERRIDES.pop(real_path, None)
+        save_metadata_overrides()
+
+
+
+CATALOG_FAVORITES_FILE = (
+    METADATA_CACHE_DIR / "catalog_favorites.json"
+)
+CATALOG_FAVORITES_LOCK = threading.RLock()
+
+
+def load_catalog_favorites():
+    try:
+        with CATALOG_FAVORITES_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            data = json.load(file)
+
+        if not isinstance(data, dict):
+            return {
+                "authors": [],
+                "series": [],
+                "tags": [],
+            }
+
+        authors = data.get("authors", [])
+        series = data.get("series", [])
+        tags = data.get("tags", [])
+
+        if not isinstance(authors, list):
+            authors = []
+
+        if not isinstance(series, list):
+            series = []
+
+        if not isinstance(tags, list):
+            tags = []
+
+        return {
+            "authors": [
+                str(author)
+                for author in authors
+                if str(author).strip()
+            ],
+            "series": [
+                item
+                for item in series
+                if isinstance(item, dict)
+                and str(item.get("series", "")).strip()
+            ],
+            "tags": [
+                " ".join(str(tag).split()).strip()
+                for tag in tags
+                if " ".join(str(tag).split()).strip()
+            ],
+        }
+
+    except (OSError, ValueError, TypeError):
+        return {
+            "authors": [],
+            "series": [],
+        }
+
+
+CATALOG_FAVORITES = load_catalog_favorites()
+
+CATALOG_FAVORITES.setdefault("authors", [])
+CATALOG_FAVORITES.setdefault("series", [])
+CATALOG_FAVORITES.setdefault("tags", [])
+
+
+def save_catalog_favorites():
+    METADATA_CACHE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary_file = (
+        CATALOG_FAVORITES_FILE.with_suffix(
+            ".json.tmp"
+        )
+    )
+
+    with temporary_file.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            CATALOG_FAVORITES,
+            file,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+
+    temporary_file.replace(
+        CATALOG_FAVORITES_FILE
+    )
+
+
+def normalize_catalog_value(value):
+    return " ".join(
+        str(value).split()
+    ).strip()
+
+
+def is_favorite_author(author):
+    author = normalize_catalog_value(author)
+
+    if not author:
+        return False
+
+    with CATALOG_FAVORITES_LOCK:
+        return author in CATALOG_FAVORITES["authors"]
+
+
+def is_favorite_series(author, series):
+    author = normalize_catalog_value(author)
+    series = normalize_catalog_value(series)
+
+    if not series:
+        return False
+
+    with CATALOG_FAVORITES_LOCK:
+        for item in CATALOG_FAVORITES["series"]:
+            if (
+                normalize_catalog_value(
+                    item.get("author", "")
+                ) == author
+                and normalize_catalog_value(
+                    item.get("series", "")
+                ) == series
+            ):
+                return True
+
+    return False
+
+
+def is_favorite_tag(tag):
+    tag = normalize_catalog_value(tag)
+
+    if not tag:
+        return False
+
+    with CATALOG_FAVORITES_LOCK:
+        return tag in CATALOG_FAVORITES["tags"]
+
+
+def toggle_favorite_tag(tag):
+    tag = normalize_catalog_value(tag)
+
+    if not tag:
+        raise ValueError(
+            "즐겨찾기에 추가할 태그가 없습니다."
+        )
+
+    with CATALOG_FAVORITES_LOCK:
+        tags = CATALOG_FAVORITES["tags"]
+
+        if tag in tags:
+            tags.remove(tag)
+            favorite = False
+        else:
+            tags.append(tag)
+            tags.sort(key=str.casefold)
+            favorite = True
+
+        save_catalog_favorites()
+
+    return favorite
+
+
+def remove_favorite_tag(tag):
+    tag = normalize_catalog_value(tag)
+
+    if not tag:
+        return False
+
+    with CATALOG_FAVORITES_LOCK:
+        tags = CATALOG_FAVORITES["tags"]
+
+        matching_tag = next(
+            (
+                saved_tag
+                for saved_tag in tags
+                if normalize_catalog_value(
+                    saved_tag
+                ).casefold() == tag.casefold()
+            ),
+            None,
+        )
+
+        if matching_tag is not None:
+            tags.remove(matching_tag)
+            save_catalog_favorites()
+
+    return False
+
+
+def remove_favorite_series(author, series):
+    author = normalize_catalog_value(author)
+    series = normalize_catalog_value(series)
+
+    if not series:
+        return False
+
+    with CATALOG_FAVORITES_LOCK:
+        items = CATALOG_FAVORITES["series"]
+
+        matched_index = None
+
+        for index, item in enumerate(items):
+            item_author = normalize_catalog_value(
+                item.get("author", "")
+            )
+
+            item_series = normalize_catalog_value(
+                item.get("series", "")
+            )
+
+            if (
+                item_author == author
+                and item_series == series
+            ):
+                matched_index = index
+                break
+
+        if matched_index is not None:
+            items.pop(matched_index)
+            save_catalog_favorites()
+
+    return False
+
+
+def toggle_favorite_author(author):
+    author = normalize_catalog_value(author)
+
+    if not author:
+        raise ValueError(
+            "즐겨찾기에 추가할 저자가 없습니다."
+        )
+
+    with CATALOG_FAVORITES_LOCK:
+        authors = CATALOG_FAVORITES["authors"]
+
+        if author in authors:
+            authors.remove(author)
+            favorite = False
+        else:
+            authors.append(author)
+            authors.sort(key=str.casefold)
+            favorite = True
+
+        save_catalog_favorites()
+
+    return favorite
+
+
+def toggle_favorite_series(author, series):
+    author = normalize_catalog_value(author)
+    series = normalize_catalog_value(series)
+
+    if not series:
+        raise ValueError(
+            "즐겨찾기에 추가할 시리즈가 없습니다."
+        )
+
+    with CATALOG_FAVORITES_LOCK:
+        items = CATALOG_FAVORITES["series"]
+
+        matched_index = None
+
+        for index, item in enumerate(items):
+            if (
+                normalize_catalog_value(
+                    item.get("author", "")
+                ) == author
+                and normalize_catalog_value(
+                    item.get("series", "")
+                ) == series
+            ):
+                matched_index = index
+                break
+
+        if matched_index is None:
+            items.append(
+                {
+                    "author": author,
+                    "series": series,
+                }
+            )
+
+            items.sort(
+                key=lambda item: (
+                    normalize_catalog_value(
+                        item.get("author", "")
+                    ).casefold(),
+                    normalize_catalog_value(
+                        item.get("series", "")
+                    ).casefold(),
+                )
+            )
+
+            favorite = True
+        else:
+            items.pop(matched_index)
+            favorite = False
+
+        save_catalog_favorites()
+
+    return favorite
+
+
+DOWNLOAD_HISTORY_FILE = METADATA_CACHE_DIR / "download_history.json"
+DOWNLOAD_HISTORY_LOCK = threading.RLock()
+RECORDED_DOWNLOAD_TOKENS = set()
+
+
+def load_download_history():
+    try:
+        with DOWNLOAD_HISTORY_FILE.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+DOWNLOAD_HISTORY = load_download_history()
+
+READING_STATUS_FILE = METADATA_CACHE_DIR / "reading_status.json"
+READING_STATUS_LOCK = threading.RLock()
+
+
+def load_reading_status():
+    try:
+        with READING_STATUS_FILE.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+READING_STATUS = load_reading_status()
+
+
+def save_reading_status():
+    METADATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    temporary_file = READING_STATUS_FILE.with_suffix(".json.tmp")
+
+    with temporary_file.open("w", encoding="utf-8") as file:
+        json.dump(
+            READING_STATUS,
+            file,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+
+    temporary_file.replace(READING_STATUS_FILE)
+
+
+def get_reading_status(file_path):
+    real_path = os.path.realpath(os.path.abspath(file_path))
+
+    with READING_STATUS_LOCK:
+        entry = READING_STATUS.get(real_path, {})
+
+        if not isinstance(entry, dict):
+            return {
+                "status": "unread",
+                "finished_at": "",
+            }
+
+        return {
+            "status": entry.get("status", "unread"),
+            "finished_at": entry.get("finished_at", ""),
+        }
+
+
+def toggle_reading_status(file_path):
+    real_path = os.path.realpath(os.path.abspath(file_path))
+
+    with READING_STATUS_LOCK:
+        current = READING_STATUS.get(real_path, {})
+
+        if (
+            isinstance(current, dict)
+            and current.get("status") == "finished"
+        ):
+            READING_STATUS[real_path] = {
+                "status": "unread",
+                "finished_at": "",
+            }
+        else:
+            READING_STATUS[real_path] = {
+                "status": "finished",
+                "finished_at": datetime.now().strftime("%Y-%m-%d"),
+            }
+
+        save_reading_status()
+
+        return READING_STATUS[real_path]
+
+
+
+def save_download_history():
+    METADATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    temporary_file = DOWNLOAD_HISTORY_FILE.with_suffix(".json.tmp")
+
+    with temporary_file.open("w", encoding="utf-8") as file:
+        json.dump(
+            DOWNLOAD_HISTORY,
+            file,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+
+    temporary_file.replace(DOWNLOAD_HISTORY_FILE)
+
+
+def record_download(client_ip, file_path, token):
+    file_path = os.path.realpath(os.path.abspath(file_path))
+
+    with DOWNLOAD_HISTORY_LOCK:
+        # 동일 다운로드 토큰의 중복 완료 기록 방지
+        if token in RECORDED_DOWNLOAD_TOKENS:
+            return
+
+        RECORDED_DOWNLOAD_TOKENS.add(token)
+
+        client_history = DOWNLOAD_HISTORY.setdefault(client_ip, {})
+        entry = client_history.setdefault(
+            file_path,
+            {
+                "count": 0,
+                "last_downloaded": "",
+            },
+        )
+
+        try:
+            current_count = int(entry.get("count", 0))
+        except (TypeError, ValueError):
+            current_count = 0
+
+        entry["count"] = current_count + 1
+        entry["last_downloaded"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+
+        try:
+            save_download_history()
+        except OSError as error:
+            print(f"[WARN] 다운로드 기록 저장 실패: {error}")
+
+
+def set_reading_status(file_path, status):
+    real_path = os.path.realpath(os.path.abspath(file_path))
+
+    if status not in ("unread", "finished"):
+        raise ValueError("잘못된 독서 상태")
+
+    with READING_STATUS_LOCK:
+        previous = READING_STATUS.get(real_path, {})
+
+        if not isinstance(previous, dict):
+            previous = {}
+
+        note = str(previous.get("note", ""))
+
+        if status == "finished":
+            finished_at = str(previous.get("finished_at", ""))
+
+            READING_STATUS[real_path] = {
+                "status": "finished",
+                "finished_at": finished_at
+                or datetime.now().strftime("%Y-%m-%d"),
+                "note": note,
+            }
+        else:
+            READING_STATUS[real_path] = {
+                "status": "unread",
+                "finished_at": "",
+                "note": note,
+            }
+
+        save_reading_status()
+        return READING_STATUS[real_path]
+
+
+def get_book_note(file_path):
+    real_path = os.path.realpath(os.path.abspath(file_path))
+
+    with READING_STATUS_LOCK:
+        entry = READING_STATUS.get(real_path, {})
+
+        if not isinstance(entry, dict):
+            return ""
+
+        return str(entry.get("note", ""))
+
+
+def set_book_note(file_path, note):
+    real_path = os.path.realpath(os.path.abspath(file_path))
+    note = str(note).strip()
+
+    if len(note) > 2000:
+        raise ValueError("메모가 너무 깁니다.")
+
+    with READING_STATUS_LOCK:
+        previous = READING_STATUS.get(real_path, {})
+
+        if not isinstance(previous, dict):
+            previous = {}
+
+        READING_STATUS[real_path] = {
+            "status": previous.get("status", "unread"),
+            "finished_at": previous.get("finished_at", ""),
+            "note": note,
+        }
+
+        save_reading_status()
+        return note
+
+
+def get_download_history(client_ip, file_path):
+    absolute_path = os.path.abspath(file_path)
+    real_path = os.path.realpath(absolute_path)
+    wanted_name = os.path.basename(file_path).casefold()
+
+    with DOWNLOAD_HISTORY_LOCK:
+        client_history = DOWNLOAD_HISTORY.get(client_ip, {})
+
+        print(
+            "[HISTORY DEBUG]",
+            "ip=", repr(client_ip),
+            "wanted=", repr(file_path),
+            "absolute=", repr(absolute_path),
+            "real=", repr(real_path),
+            "saved_keys=", list(client_history.keys()),
+        )
+
+        if not isinstance(client_history, dict):
+            return None
+
+        entry = client_history.get(real_path)
+
+        if not isinstance(entry, dict):
+            entry = client_history.get(absolute_path)
+
+        # Termux 공유 저장소 경로 표현이 달라도
+        # 마지막 파일명이 같으면 같은 책으로 본다.
+        if not isinstance(entry, dict):
+            for saved_path, saved_entry in client_history.items():
+                if not isinstance(saved_entry, dict):
+                    continue
+
+                saved_name = os.path.basename(saved_path).casefold()
+
+                if saved_name == wanted_name:
+                    entry = saved_entry
+                    break
+
+        if not isinstance(entry, dict):
+            return None
+
+        try:
+            count = int(entry.get("count", 0))
+        except (TypeError, ValueError):
+            count = 0
+
+        return {
+            "count": count,
+            "last_downloaded": str(
+                entry.get("last_downloaded", "")
+            ),
+        }
+
+
+
+
+def build_download_history_modal(client_ip):
+    with DOWNLOAD_HISTORY_LOCK:
+        client_history = DOWNLOAD_HISTORY.get(client_ip, {})
+
+        if not isinstance(client_history, dict):
+            client_history = {}
+
+        history_items = list(client_history.items())
+
+    # 심볼릭 링크 경로와 실제 경로가 함께 저장된 경우 중복 제거
+    merged = {}
+
+    for saved_path, entry in history_items:
+        if not isinstance(entry, dict):
+            continue
+
+        canonical_path = os.path.realpath(saved_path)
+        previous = merged.get(canonical_path)
+
+        try:
+            count = int(entry.get("count", 0))
+        except (TypeError, ValueError):
+            count = 0
+
+        timestamp = str(entry.get("last_downloaded", ""))
+
+        if previous is None:
+            merged[canonical_path] = {
+                "path": saved_path,
+                "count": count,
+                "last_downloaded": timestamp,
+            }
+            continue
+
+        # 같은 파일의 옛 경로와 새 경로가 같이 있으면
+        # 더 큰 횟수와 더 최근 시각을 사용한다.
+        previous["count"] = max(previous["count"], count)
+
+        if timestamp > previous["last_downloaded"]:
+            previous["last_downloaded"] = timestamp
+            previous["path"] = saved_path
+
+    records = list(merged.values())
+    records.sort(
+        key=lambda item: item["last_downloaded"],
+        reverse=True,
+    )
+
+    if not records:
+        list_html = """
+        <div class="history-empty">
+            아직 이 기기에서 받은 책이 없습니다.
+        </div>
+        """
+    else:
+        rows = []
+
+        for record in records:
+            saved_path = record["path"]
+            filename = os.path.basename(saved_path)
+            metadata = get_book_metadata(saved_path)
+
+            title = metadata.get("title", "").strip()
+            author = metadata.get("author", "").strip()
+
+            if not title:
+                title = os.path.splitext(filename)[0]
+
+            timestamp = record["last_downloaded"]
+            formatted_time = timestamp
+
+            if timestamp:
+                try:
+                    formatted_time = datetime.fromisoformat(
+                        timestamp
+                    ).strftime("%Y-%m-%d %H:%M")
+                except ValueError:
+                    pass
+
+            author_html = ""
+
+            if author:
+                author_html = f"""
+                <div class="history-author">
+                    {html.escape(author)}
+                </div>
+                """
+
+            rows.append(
+                f"""
+                <article class="history-item">
+                    <div class="history-title">
+                        {html.escape(title)}
+                    </div>
+
+                    {author_html}
+
+                    <div class="history-meta">
+                        {record["count"]}회
+                        · 마지막 {html.escape(formatted_time)}
+                    </div>
+                </article>
+                """
+            )
+
+        list_html = "".join(rows)
+
+    return f"""
+    <div class="history-panel">
+        <div class="history-panel-title">
+            이 기기에 받은 책
+        </div>
+
+        <div class="history-list">
+            {list_html}
+        </div>
+    </div>
+    """
+
+
+def format_download_history(entry):
+    if not entry or entry.get("count", 0) < 1:
+        return ""
+
+    count = entry["count"]
+    timestamp = entry.get("last_downloaded", "")
+    formatted_time = ""
+
+    if timestamp:
+        try:
+            formatted_time = datetime.fromisoformat(
+                timestamp
+            ).strftime("%m-%d %H:%M")
+        except ValueError:
+            formatted_time = timestamp
+
+    if formatted_time:
+        return f"{count}회 · 마지막 {formatted_time}"
+
+    return f"{count}회"
+
+
+
+def save_metadata_cache():
+    METADATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    temporary_file = METADATA_CACHE_FILE.with_suffix(".json.tmp")
+
+    with temporary_file.open("w", encoding="utf-8") as file:
+        json.dump(
+            METADATA_CACHE,
+            file,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+
+    temporary_file.replace(METADATA_CACHE_FILE)
+
+
+def xml_local_name(tag):
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def clean_metadata_text(value):
+    if not value:
+        return ""
+
+    return " ".join(str(value).split()).strip()
+
+
+def read_epub_metadata(file_path):
+    title = ""
+    authors = []
+    language = ""
+
+    try:
+        with zipfile.ZipFile(file_path, "r") as epub:
+            container_data = epub.read("META-INF/container.xml")
+            container_root = ET.fromstring(container_data)
+
+            package_path = ""
+
+            for element in container_root.iter():
+                if xml_local_name(element.tag) != "rootfile":
+                    continue
+
+                package_path = element.attrib.get("full-path", "").strip()
+
+                if package_path:
+                    break
+
+            if not package_path:
+                raise ValueError("EPUB package 경로 없음")
+
+            package_data = epub.read(package_path)
+            package_root = ET.fromstring(package_data)
+
+            for element in package_root.iter():
+                local_name = xml_local_name(element.tag)
+                value = clean_metadata_text(element.text)
+
+                if not value:
+                    continue
+
+                if local_name == "title" and not title:
+                    title = value
+                elif local_name == "creator" and value not in authors:
+                    authors.append(value)
+                elif local_name == "language" and not language:
+                    language = value
+
+    except (
+        OSError,
+        KeyError,
+        ValueError,
+        zipfile.BadZipFile,
+        ET.ParseError,
+    ):
+        return {
+            "title": "",
+            "author": "",
+            "language": "",
+        }
+
+    return {
+        "title": title,
+        "author": ", ".join(authors),
+        "language": language,
+    }
+
+
+def get_book_metadata(file_path):
+    file_path = os.path.abspath(file_path)
+    extension = os.path.splitext(file_path)[1].lower()
+
+    if extension != ".epub":
+        return apply_metadata_override(
+            file_path,
+            {
+                "title": "",
+                "author": "",
+                "language": "",
+            },
+        )
+
+    try:
+        stat = os.stat(file_path)
+    except OSError:
+        return apply_metadata_override(
+            file_path,
+            {
+                "title": "",
+                "author": "",
+                "language": "",
+            },
+        )
+
+    signature = {
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+    }
+
+    with METADATA_CACHE_LOCK:
+        cached = METADATA_CACHE.get(file_path)
+
+        if (
+            isinstance(cached, dict)
+            and cached.get("mtime_ns") == signature["mtime_ns"]
+            and cached.get("size") == signature["size"]
+            and "language" in cached
+        ):
+            return apply_metadata_override(
+                file_path,
+                {
+                    "title": cached.get("title", ""),
+                    "author": cached.get("author", ""),
+                    "language": cached.get("language", ""),
+                },
+            )
+
+    metadata = read_epub_metadata(file_path)
+
+    cache_entry = {
+        **signature,
+        "title": metadata["title"],
+        "author": metadata["author"],
+        "language": metadata["language"],
+    }
+
+    with METADATA_CACHE_LOCK:
+        METADATA_CACHE[file_path] = cache_entry
+
+        try:
+            save_metadata_cache()
+        except OSError as error:
+            print(
+                f"[WARN] 메타데이터 캐시 저장 실패: {error}"
+            )
+
+    return apply_metadata_override(
+        file_path,
+        metadata,
+    )
+
+
+BOOK_TYPES = {
+    ".epub": ("EPUB", "application/epub+zip"),
+    ".pdf": ("PDF", "application/pdf"),
+    ".mobi": ("MOBI", "application/x-mobipocket-ebook"),
+    ".azw": ("AZW", "application/vnd.amazon.ebook"),
+    ".azw3": ("AZW3", "application/vnd.amazon.ebook"),
+    ".cbz": ("CBZ", "application/vnd.comicbook+zip"),
+    ".cbr": ("CBR", "application/vnd.comicbook-rar"),
+    ".txt": ("TXT", "text/plain; charset=utf-8"),
+    ".ttf": ("TTF", "font/ttf"),
+    ".otf": ("OTF", "font/otf"),
+    ".woff": ("WOFF", "font/woff"),
+    ".woff2": ("WOFF2", "font/woff2"),
+}
+
+TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{4,80}$")
+PROGRESS_TTL = 60 * 60
+
+
+def human_size(size):
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(size)
+
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+    return f"{size} B"
+
+
+def safe_ascii_filename(filename):
+    fallback_extension = os.path.splitext(filename)[1] or ".bin"
+
+    ascii_name = (
+        filename.encode("ascii", "ignore")
+        .decode("ascii")
+        .strip()
+        .replace('"', "_")
+        .replace("\\", "_")
+    )
+
+    if not ascii_name:
+        ascii_name = f"book{fallback_extension}"
+
+    return ascii_name
+
+
+class ProgressStore:
+    def __init__(self):
+        self._items = {}
+        self._lock = threading.Lock()
+
+    def cleanup(self):
+        cutoff = time.time() - PROGRESS_TTL
+
+        with self._lock:
+            expired = [
+                token
+                for token, item in self._items.items()
+                if item.get("updated_at", 0) < cutoff
+            ]
+
+            for token in expired:
+                self._items.pop(token, None)
+
+    def start(self, token, filename, total, start_offset=0):
+        now = time.time()
+
+        with self._lock:
+            previous = self._items.get(token, {})
+            previous_sent = int(previous.get("sent", 0))
+
+            self._items[token] = {
+                "filename": filename,
+                "total": total,
+                "sent": max(previous_sent, start_offset),
+                "status": "downloading",
+                "message": "전송 중",
+                "started_at": previous.get("started_at", now),
+                "updated_at": now,
+            }
+
+    def update(self, token, absolute_sent):
+        with self._lock:
+            item = self._items.get(token)
+
+            if not item:
+                return
+
+            item["sent"] = max(int(item.get("sent", 0)), int(absolute_sent))
+            item["status"] = "downloading"
+            item["message"] = "전송 중"
+            item["updated_at"] = time.time()
+
+    def complete(self, token):
+        with self._lock:
+            item = self._items.get(token)
+
+            if not item:
+                return
+
+            item["sent"] = int(item.get("total", item.get("sent", 0)))
+            item["status"] = "complete"
+            item["message"] = "서버 전송 완료"
+            item["updated_at"] = time.time()
+
+    def interrupt(self, token):
+        with self._lock:
+            item = self._items.get(token)
+
+            if not item:
+                return
+
+            item["status"] = "interrupted"
+            item["message"] = "연결이 끊겼습니다"
+            item["updated_at"] = time.time()
+
+    def cancel(self, token):
+        with self._lock:
+            item = self._items.get(token)
+
+            if not item:
+                return
+
+            item["status"] = "cancelled"
+            item["message"] = "사용자가 전송을 취소했습니다"
+            item["updated_at"] = time.time()
+
+    def is_cancelled(self, token):
+        with self._lock:
+            item = self._items.get(token)
+            return bool(item and item.get("status") == "cancelled")
+
+    def error(self, token, message):
+        with self._lock:
+            item = self._items.setdefault(
+                token,
+                {
+                    "filename": "",
+                    "total": 0,
+                    "sent": 0,
+                    "started_at": time.time(),
+                },
+            )
+
+            item["status"] = "error"
+            item["message"] = message
+            item["updated_at"] = time.time()
+
+    def get(self, token):
+        self.cleanup()
+
+        with self._lock:
+            item = self._items.get(token)
+
+            if not item:
+                return {
+                    "status": "waiting",
+                    "message": "다운로드 시작 대기 중",
+                    "sent": 0,
+                    "total": 0,
+                    "percent": 0,
+                }
+
+            result = dict(item)
+
+        total = int(result.get("total", 0))
+        sent = int(result.get("sent", 0))
+
+        if total > 0:
+            percent = min(100, int(sent * 100 / total))
+        else:
+            percent = 0
+
+        result["percent"] = percent
+        result["sent_text"] = human_size(sent)
+        result["total_text"] = human_size(total)
+
+        return result
+
+
+PROGRESS = ProgressStore()
+
+
+
+ALLOWED_CLIENTS = {
+    "127.0.0.1",
+    "192.168.219.122",  # 카르타
+    "192.168.219.131",    # 고7
+    "192.168.219.240",    # 고7
+    "192.168.219.126",  # S25
+}
+
+class BookHandler(SimpleHTTPRequestHandler):
+
+    def is_client_allowed(self):
+        return self.client_address[0] in ALLOWED_CLIENTS
+
+    def reject_unallowed_client(self):
+        client_ip = self.client_address[0]
+
+        if self.is_client_allowed():
+            return False
+
+        print(f"[BLOCK] 허용되지 않은 접속: {client_ip}")
+
+        body = "접근이 허용되지 않은 기기입니다.\n".encode("utf-8")
+
+        self.send_response(403)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+        return True
+
+    server_version = "PocketLibrary/2.0"
+    protocol_version = "HTTP/1.1"
+
+    extensions_map = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        **{
+            extension: mime
+            for extension, (_, mime) in BOOK_TYPES.items()
+        },
+    }
+
+    def do_GET(self):
+        if self.reject_unallowed_client():
+            return
+
+        parsed = urlsplit(self.path)
+        request_path = unquote(parsed.path)
+
+        if request_path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if request_path == "/progress":
+            self.serve_progress(parsed.query)
+            return
+
+        if request_path == "/cancel":
+            self.serve_cancel(parsed.query)
+            return
+
+        if request_path == "/reading-status":
+            self.serve_reading_status(parsed.query)
+            return
+
+        if request_path.startswith("/download/"):
+            self.serve_download(request_path, parsed.query, head_only=False)
+            return
+
+        local_path = self.translate_path(parsed.path)
+
+        if os.path.isdir(local_path):
+            response = self.list_directory(local_path)
+
+            if response:
+                try:
+                    self.copyfile(response, self.wfile)
+                finally:
+                    response.close()
+            return
+
+        self.send_error(404, "파일을 찾을 수 없습니다.")
+
+    def do_POST(self):
+        if self.reject_unallowed_client():
+            return
+
+        parsed = urlsplit(self.path)
+        request_path = unquote(parsed.path)
+
+        if request_path not in (
+            "/book-note",
+            "/book-metadata",
+            "/catalog-favorite",
+        ):
+            self.send_error(
+                404,
+                "요청 경로를 찾을 수 없습니다.",
+            )
+            return
+
+        try:
+            content_length = int(
+                self.headers.get("Content-Length", "0")
+            )
+        except (TypeError, ValueError):
+            content_length = 0
+
+        if (
+            content_length <= 0
+            or content_length > 16384
+        ):
+            self.send_error(
+                400,
+                "잘못된 요청입니다.",
+            )
+            return
+
+        try:
+            request_body = self.rfile.read(
+                content_length
+            ).decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            self.send_error(
+                400,
+                "요청 내용을 읽지 못했습니다.",
+            )
+            return
+
+        params = parse_qs(
+            request_body,
+            keep_blank_values=True,
+        )
+
+        if request_path == "/catalog-favorite":
+            favorite_type = normalize_catalog_value(
+                params.get(
+                    "type",
+                    [""],
+                )[0]
+            )
+
+            author = normalize_catalog_value(
+                params.get(
+                    "author",
+                    [""],
+                )[0]
+            )
+
+            series = normalize_catalog_value(
+                params.get(
+                    "series",
+                    [""],
+                )[0]
+            )
+
+            tag = normalize_catalog_value(
+                params.get(
+                    "tag",
+                    [""],
+                )[0]
+            )
+
+            favorite_action = params.get(
+                "action",
+                ["toggle"],
+            )[0].strip().lower()
+
+            try:
+                if favorite_type == "author":
+                    favorite = toggle_favorite_author(
+                        author
+                    )
+
+                elif favorite_type == "series":
+                    if favorite_action == "remove":
+                        favorite = remove_favorite_series(
+                            author,
+                            series,
+                        )
+                    else:
+                        favorite = toggle_favorite_series(
+                            author,
+                            series,
+                        )
+
+                elif favorite_type == "tag":
+                    if favorite_action == "remove":
+                        favorite = remove_favorite_tag(
+                            tag
+                        )
+                    else:
+                        favorite = toggle_favorite_tag(
+                            tag
+                        )
+
+                else:
+                    raise ValueError(
+                        "잘못된 즐겨찾기 종류입니다."
+                    )
+
+            except ValueError as error:
+                self.send_json(
+                    {
+                        "status": "error",
+                        "message": str(error),
+                    },
+                    status=400,
+                )
+                return
+
+            except OSError as error:
+                print(
+                    "[WARN] 카탈로그 즐겨찾기 "
+                    "저장 실패: "
+                    + str(error)
+                )
+
+                self.send_json(
+                    {
+                        "status": "error",
+                        "message": (
+                            "즐겨찾기를 저장하지 "
+                            "못했습니다."
+                        ),
+                    },
+                    status=500,
+                )
+                return
+
+            self.send_json(
+                {
+                    "status": "ok",
+                    "favorite": favorite,
+                    "type": favorite_type,
+                }
+            )
+            return
+
+        relative_path = params.get(
+            "path",
+            [""],
+        )[0]
+
+        if not relative_path:
+            self.send_error(
+                400,
+                "책 경로가 없습니다.",
+            )
+            return
+
+        local_path = self.translate_path(
+            "/" + relative_path.lstrip("/")
+        )
+
+        if not os.path.isfile(local_path):
+            self.send_error(
+                404,
+                "책을 찾을 수 없습니다.",
+            )
+            return
+
+        if request_path == "/book-metadata":
+            title = params.get(
+                "title",
+                [""],
+            )[0]
+
+            author = params.get(
+                "author",
+                [""],
+            )[0]
+
+            language = params.get(
+                "language",
+                [""],
+            )[0]
+
+            series = params.get(
+                "series",
+                [""],
+            )[0]
+
+            series_index = params.get(
+                "series_index",
+                [""],
+            )[0]
+
+            published_at = params.get(
+                "published_at",
+                [""],
+            )[0]
+
+            tags_text = params.get(
+                "tags",
+                [""],
+            )[0]
+
+            action = params.get(
+                "action",
+                ["save"],
+            )[0]
+
+            try:
+                if action == "reset":
+                    clear_metadata_override(
+                        local_path
+                    )
+
+                    saved_metadata = (
+                        get_book_metadata(
+                            local_path
+                        )
+                    )
+
+                elif action == "save":
+                    saved_metadata = (
+                        set_metadata_override(
+                            local_path,
+                            title,
+                            author,
+                            language,
+                            series,
+                            series_index,
+                            published_at,
+                            tags_text,
+                        )
+                    )
+
+                else:
+                    raise ValueError(
+                        "잘못된 메타데이터 작업입니다."
+                    )
+
+            except ValueError as error:
+                self.send_json(
+                    {
+                        "status": "error",
+                        "message": str(error),
+                    },
+                    status=400,
+                )
+                return
+
+            except OSError as error:
+                print(
+                    "[WARN] 메타데이터 저장 실패: "
+                    + str(error)
+                )
+
+                self.send_json(
+                    {
+                        "status": "error",
+                        "message": (
+                            "메타데이터를 "
+                            "저장하지 못했습니다."
+                        ),
+                    },
+                    status=500,
+                )
+                return
+
+            self.send_json(
+                {
+                    "status": "ok",
+                    "metadata": saved_metadata,
+                }
+            )
+            return
+
+        note = params.get(
+            "note",
+            [""],
+        )[0]
+
+        try:
+            saved_note = set_book_note(
+                local_path,
+                note,
+            )
+
+        except ValueError as error:
+            self.send_json(
+                {
+                    "status": "error",
+                    "message": str(error),
+                },
+                status=400,
+            )
+            return
+
+        except OSError as error:
+            print(
+                f"[WARN] 책 메모 저장 실패: {error}"
+            )
+
+            self.send_json(
+                {
+                    "status": "error",
+                    "message": (
+                        "메모를 저장하지 못했습니다."
+                    ),
+                },
+                status=500,
+            )
+            return
+
+        self.send_json(
+            {
+                "status": "ok",
+                "note": saved_note,
+            }
+        )
+
+    def do_HEAD(self):
+        if self.reject_unallowed_client():
+            return
+
+        parsed = urlsplit(self.path)
+        request_path = unquote(parsed.path)
+
+        if request_path.startswith("/download/"):
+            self.serve_download(request_path, parsed.query, head_only=True)
+            return
+
+        local_path = self.translate_path(parsed.path)
+
+        if os.path.isfile(local_path):
+            self.send_file_headers(local_path, head_only=True)
+            return
+
+        self.send_error(404, "파일을 찾을 수 없습니다.")
+
+    def serve_reading_status(self, query):
+        params = parse_qs(query)
+
+        relative_path = params.get("path", [""])[0]
+        requested_status = params.get("status", [""])[0]
+        return_url = params.get("return", ["/"])[0]
+
+        if not relative_path:
+            self.send_error(400, "책 경로가 없습니다.")
+            return
+
+        if requested_status not in ("unread", "finished"):
+            self.send_error(400, "잘못된 독서 상태입니다.")
+            return
+
+        local_path = self.translate_path("/" + relative_path.lstrip("/"))
+
+        if not os.path.isfile(local_path):
+            self.send_error(404, "책을 찾을 수 없습니다.")
+            return
+
+        try:
+            saved_status = set_reading_status(
+                local_path,
+                requested_status,
+            )
+        except (OSError, ValueError) as error:
+            print(f"[WARN] 독서 상태 저장 실패: {error}")
+            self.send_error(500, "독서 상태를 저장하지 못했습니다.")
+            return
+
+        if params.get("ajax", [""])[0] == "1":
+            self.send_json(
+                {
+                    "status": "ok",
+                    "reading_status": saved_status.get(
+                        "status",
+                        "unread",
+                    ),
+                    "finished_at": saved_status.get(
+                        "finished_at",
+                        "",
+                    ),
+                }
+            )
+            return
+
+        if not return_url.startswith("/") or return_url.startswith("//"):
+            return_url = "/"
+
+        self.send_response(303)
+        self.send_header("Location", return_url)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def serve_progress(self, query):
+        params = parse_qs(query)
+        token = params.get("id", [""])[0]
+
+        if not TOKEN_PATTERN.fullmatch(token):
+            self.send_json(
+                {
+                    "status": "error",
+                    "message": "잘못된 다운로드 ID",
+                    "sent": 0,
+                    "total": 0,
+                    "percent": 0,
+                },
+                status=400,
+            )
+            return
+
+        self.send_json(PROGRESS.get(token))
+
+    def serve_cancel(self, query):
+        params = parse_qs(query)
+        token = params.get("id", [""])[0]
+
+        if not TOKEN_PATTERN.fullmatch(token):
+            self.send_json(
+                {
+                    "status": "error",
+                    "message": "잘못된 다운로드 ID",
+                },
+                status=400,
+            )
+            return
+
+        PROGRESS.cancel(token)
+
+        self.send_json(
+            {
+                "status": "cancelled",
+                "message": "전송 취소 요청을 처리했습니다",
+            }
+        )
+
+    def send_json(self, payload, status=200):
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        if self.command != "HEAD":
+            self.wfile.write(encoded)
+
+    def resolve_download_path(self, request_path):
+        relative_url = request_path[len("/download/"):]
+        relative_path = unquote(relative_url).replace("\\", "/")
+
+        normalized = posixpath.normpath("/" + relative_path).lstrip("/")
+        candidate = os.path.abspath(
+            os.path.join(self.directory, *normalized.split("/"))
+        )
+        root = os.path.abspath(self.directory)
+
+        try:
+            common = os.path.commonpath((root, candidate))
+        except ValueError:
+            return None
+
+        if common != root:
+            return None
+
+        if not os.path.isfile(candidate):
+            return None
+
+        return candidate
+
+    def parse_range(self, range_header, file_size):
+        if not range_header:
+            return 0, file_size - 1, False
+
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+
+        if not match:
+            return None
+
+        start_text, end_text = match.groups()
+
+        try:
+            if start_text:
+                start = int(start_text)
+                end = int(end_text) if end_text else file_size - 1
+            else:
+                suffix_length = int(end_text)
+
+                if suffix_length <= 0:
+                    return None
+
+                start = max(0, file_size - suffix_length)
+                end = file_size - 1
+        except ValueError:
+            return None
+
+        if start < 0 or end < start or start >= file_size:
+            return None
+
+        end = min(end, file_size - 1)
+
+        return start, end, True
+
+    def serve_download(self, request_path, query, head_only=False):
+        params = parse_qs(query)
+        token = params.get("id", [""])[0]
+
+        if not TOKEN_PATTERN.fullmatch(token):
+            self.send_error(400, "잘못된 다운로드 ID")
+            return
+
+        local_path = self.resolve_download_path(request_path)
+
+        if not local_path:
+            PROGRESS.error(token, "파일을 찾을 수 없습니다")
+            self.send_error(404, "파일을 찾을 수 없습니다.")
+            return
+
+        filename = os.path.basename(local_path)
+        file_size = os.path.getsize(local_path)
+
+        range_result = self.parse_range(
+            self.headers.get("Range"),
+            file_size,
+        )
+
+        if range_result is None:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{file_size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        start, end, is_partial = range_result
+        content_length = end - start + 1
+
+        extension = os.path.splitext(filename)[1].lower()
+        content_type = BOOK_TYPES.get(
+            extension,
+            ("FILE", mimetypes.guess_type(filename)[0] or "application/octet-stream"),
+        )[1]
+
+        PROGRESS.start(
+            token,
+            filename,
+            file_size,
+            start_offset=start,
+        )
+
+        self.send_response(206 if is_partial else 200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(content_length))
+        self.send_header("Accept-Ranges", "bytes")
+
+        if is_partial:
+            self.send_header(
+                "Content-Range",
+                f"bytes {start}-{end}/{file_size}",
+            )
+
+        # 구형 Moon+가 다운로드 URL의 원래 파일명을 사용하도록
+        # Content-Disposition 헤더는 보내지 않는다.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        if head_only:
+            return
+
+        sent_this_request = 0
+        chunk_size = 128 * 1024
+
+        try:
+            with open(local_path, "rb") as source:
+                source.seek(start)
+                remaining = content_length
+
+                while remaining > 0:
+                    if PROGRESS.is_cancelled(token):
+                        print(
+                            f"[BOOK] {self.client_address[0]} "
+                            f"사용자 취소: {filename} "
+                            f"({human_size(start + sent_this_request)} / "
+                            f"{human_size(file_size)})"
+                        )
+                        return
+
+                    chunk = source.read(min(chunk_size, remaining))
+
+                    if not chunk:
+                        break
+
+                    self.wfile.write(chunk)
+                    sent_this_request += len(chunk)
+                    remaining -= len(chunk)
+
+                    PROGRESS.update(
+                        token,
+                        start + sent_this_request,
+                    )
+
+            if sent_this_request == content_length:
+                if end >= file_size - 1:
+                    PROGRESS.complete(token)
+
+                    record_download(
+                        self.client_address[0],
+                        local_path,
+                        token,
+                    )
+                else:
+                    PROGRESS.update(token, end + 1)
+
+                print(
+                    f"[BOOK] {self.client_address[0]} "
+                    f"전송 완료: {filename} "
+                    f"({human_size(sent_this_request)})"
+                )
+            else:
+                PROGRESS.interrupt(token)
+
+        except (BrokenPipeError, ConnectionResetError):
+            PROGRESS.interrupt(token)
+
+            print(
+                f"[BOOK] {self.client_address[0]} "
+                f"전송 중 연결 종료: {filename} "
+                f"({human_size(start + sent_this_request)} / "
+                f"{human_size(file_size)})"
+            )
+
+        except OSError as error:
+            PROGRESS.error(token, f"전송 오류: {error}")
+
+            print(
+                f"[BOOK] 전송 오류: {filename}: {error}"
+            )
+
+    def send_file_headers(self, local_path, head_only=False):
+        filename = os.path.basename(local_path)
+        file_size = os.path.getsize(local_path)
+        extension = os.path.splitext(filename)[1].lower()
+
+        content_type = BOOK_TYPES.get(
+            extension,
+            ("FILE", mimetypes.guess_type(filename)[0] or "application/octet-stream"),
+        )[1]
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(file_size))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def list_directory(self, path):
+        try:
+            entries = sorted(
+                os.listdir(path),
+                key=lambda name: (
+                    not os.path.isdir(os.path.join(path, name)),
+                    name.casefold(),
+                ),
+            )
+        except OSError:
+            self.send_error(404, "폴더를 읽을 수 없습니다.")
+            return None
+
+        parsed = urlsplit(self.path)
+        request_path = unquote(parsed.path)
+        params = parse_qs(parsed.query)
+
+        if not request_path.endswith("/"):
+            request_path += "/"
+
+        # 보기 옵션이 없는 주소는 스크롤 모드 URL로 이동
+        if "view" not in params:
+            redirect_path = quote(request_path, safe="/")
+
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                redirect_path + "?view=page&page=1",
+            )
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return None
+
+        view_mode = params.get("view", ["scroll"])[0]
+
+        if view_mode not in ("scroll", "page"):
+            view_mode = "scroll"
+
+        reading_filter = params.get("reading", ["all"])[0]
+
+        if reading_filter not in ("all", "unread", "finished"):
+            reading_filter = "all"
+
+        language_filter = params.get("language", ["all"])[0]
+
+        if language_filter not in ("all", "ko", "en", "ja"):
+            language_filter = "all"
+
+        catalog_mode = params.get(
+            "catalog",
+            [""],
+        )[0].strip()
+
+        if catalog_mode not in ("", "series"):
+            catalog_mode = ""
+
+        selected_tags = normalize_book_tags(
+            params.get("tag", [])
+        )
+
+        author_filter = ""
+
+        series_filter = params.get(
+            "series",
+            [""],
+        )[0].strip()
+
+        sort_mode = params.get(
+            "sort",
+            ["default"],
+        )[0]
+
+        if sort_mode not in (
+            "default",
+            "author",
+            "series",
+            "published",
+        ):
+            sort_mode = "default"
+
+        try:
+            current_page = max(
+                1,
+                int(params.get("page", ["1"])[0]),
+            )
+        except (TypeError, ValueError):
+            current_page = 1
+
+        items_per_page = 5
+        display_entries = []
+
+        for entry_name in entries:
+            if entry_name.startswith("."):
+                continue
+
+            if entry_name.casefold() == "moonreader":
+                continue
+
+            entry_path = os.path.join(path, entry_name)
+
+            if os.path.isdir(entry_path):
+                display_entries.append(entry_name)
+                continue
+
+            extension = os.path.splitext(
+                entry_name
+            )[1].lower()
+
+            if extension in BOOK_TYPES:
+                display_entries.append(entry_name)
+
+        search_query = params.get("q", [""])[0].strip()
+        search_key = search_query.casefold()
+        metadata_by_name = {}
+
+        for entry_name in display_entries:
+            entry_path = os.path.join(path, entry_name)
+
+            if os.path.isfile(entry_path):
+                metadata_by_name[entry_name] = get_book_metadata(entry_path)
+            else:
+                metadata_by_name[entry_name] = {
+                    "title": "",
+                    "author": "",
+                }
+
+        if search_key:
+            filtered_entries = []
+
+            for entry_name in display_entries:
+                metadata = metadata_by_name.get(entry_name, {})
+                searchable_text = " ".join(
+                    (
+                        entry_name,
+                        metadata.get("title", ""),
+                        metadata.get("author", ""),
+                        metadata.get("series", ""),
+                        " ".join(
+                            normalize_book_tags(
+                                metadata.get("tags", [])
+                            )
+                        ),
+                    )
+                ).casefold()
+
+                if search_key in searchable_text:
+                    filtered_entries.append(entry_name)
+
+            display_entries = filtered_entries
+
+        if reading_filter != "all":
+            filtered_entries = []
+
+            for entry_name in display_entries:
+                entry_path = os.path.join(path, entry_name)
+
+                # 미독/완독 모아보기에서는 폴더를 제외하고 책만 표시
+                if not os.path.isfile(entry_path):
+                    continue
+
+                reading_status = get_reading_status(entry_path)
+
+                if reading_status.get("status", "unread") == reading_filter:
+                    filtered_entries.append(entry_name)
+
+            display_entries = filtered_entries
+
+        language_counts = {
+            "all": 0,
+            "ko": 0,
+            "en": 0,
+            "ja": 0,
+        }
+
+        for entry_name in display_entries:
+            entry_path = os.path.join(path, entry_name)
+
+            if not os.path.isfile(entry_path):
+                continue
+
+            language_counts["all"] += 1
+
+            metadata = metadata_by_name.get(entry_name, {})
+            counted_language = str(
+                metadata.get("language", "")
+            ).strip().lower()
+
+            counted_language_base = counted_language.split(
+                "-",
+                1,
+            )[0]
+            counted_language_base = counted_language_base.split(
+                "_",
+                1,
+            )[0]
+
+            if counted_language_base in language_counts:
+                language_counts[counted_language_base] += 1
+
+        if language_filter != "all":
+            filtered_entries = []
+
+            for entry_name in display_entries:
+                entry_path = os.path.join(path, entry_name)
+
+                # 언어 모아보기에서는 폴더를 제외하고 책만 표시
+                if not os.path.isfile(entry_path):
+                    continue
+
+                metadata = metadata_by_name.get(entry_name, {})
+                book_language = str(
+                    metadata.get("language", "")
+                ).strip().lower()
+
+                # ko-KR, en-US처럼 지역 코드가 붙은 값도 묶는다.
+                language_base = book_language.split("-", 1)[0]
+                language_base = language_base.split("_", 1)[0]
+
+                if language_base == language_filter:
+                    filtered_entries.append(entry_name)
+
+            display_entries = filtered_entries
+
+        catalog_base_entries = list(
+            display_entries
+        )
+
+        available_series = {}
+        available_tags = {}
+
+        for entry_name in catalog_base_entries:
+            entry_path = os.path.join(
+                path,
+                entry_name,
+            )
+
+            if not os.path.isfile(entry_path):
+                continue
+
+            metadata = metadata_by_name.get(
+                entry_name,
+                {},
+            )
+
+            series_value = str(
+                metadata.get("series", "")
+            ).strip()
+
+            if series_value:
+                available_series[series_value] = (
+                    available_series.get(
+                        series_value,
+                        0,
+                    )
+                    + 1
+                )
+
+            for tag_value in normalize_book_tags(
+                metadata.get("tags", [])
+            ):
+                available_tags[tag_value] = (
+                    available_tags.get(
+                        tag_value,
+                        0,
+                    )
+                    + 1
+                )
+
+        if catalog_mode == "series" and series_filter:
+            filtered_entries = []
+
+            for entry_name in display_entries:
+                entry_path = os.path.join(
+                    path,
+                    entry_name,
+                )
+
+                if not os.path.isfile(entry_path):
+                    continue
+
+                metadata = metadata_by_name.get(
+                    entry_name,
+                    {},
+                )
+
+                series_value = str(
+                    metadata.get("series", "")
+                ).strip()
+
+                if series_value == series_filter:
+                    filtered_entries.append(
+                        entry_name
+                    )
+
+            display_entries = filtered_entries
+
+        if selected_tags:
+            selected_tag_keys = {
+                tag.casefold()
+                for tag in selected_tags
+            }
+
+            filtered_entries = []
+
+            for entry_name in display_entries:
+                entry_path = os.path.join(
+                    path,
+                    entry_name,
+                )
+
+                if not os.path.isfile(entry_path):
+                    continue
+
+                metadata = metadata_by_name.get(
+                    entry_name,
+                    {},
+                )
+
+                book_tag_keys = {
+                    tag.casefold()
+                    for tag in normalize_book_tags(
+                        metadata.get("tags", [])
+                    )
+                }
+
+                if selected_tag_keys.issubset(
+                    book_tag_keys
+                ):
+                    filtered_entries.append(
+                        entry_name
+                    )
+
+            display_entries = filtered_entries
+
+        def catalog_number(value):
+            try:
+                return float(str(value).strip())
+            except (TypeError, ValueError):
+                return float("inf")
+
+        def catalog_sort_key(entry_name):
+            entry_path = os.path.join(
+                path,
+                entry_name,
+            )
+
+            if os.path.isdir(entry_path):
+                return (
+                    0,
+                    "",
+                    "",
+                    0.0,
+                    "",
+                    entry_name.casefold(),
+                )
+
+            metadata = metadata_by_name.get(
+                entry_name,
+                {},
+            )
+
+            title_value = str(
+                metadata.get("title", "")
+            ).strip()
+
+            author_value = str(
+                metadata.get("author", "")
+            ).strip()
+
+            series_value = str(
+                metadata.get("series", "")
+            ).strip()
+
+            series_index_value = metadata.get(
+                "series_index",
+                "",
+            )
+
+            published_value = str(
+                metadata.get(
+                    "published_at",
+                    "",
+                )
+            ).strip()
+
+            return (
+                1,
+                author_value.casefold(),
+                series_value.casefold(),
+                catalog_number(
+                    series_index_value
+                ),
+                published_value,
+                (
+                    title_value
+                    or entry_name
+                ).casefold(),
+            )
+
+        if catalog_mode == "series":
+            if sort_mode == "author":
+                display_entries.sort(
+                    key=lambda entry_name: (
+                        catalog_sort_key(entry_name)[0],
+                        catalog_sort_key(entry_name)[1],
+                        catalog_sort_key(entry_name)[5],
+                    )
+                )
+
+            elif sort_mode == "published":
+                display_entries.sort(
+                    key=lambda entry_name: (
+                        catalog_sort_key(entry_name)[0],
+                        (
+                            catalog_sort_key(
+                                entry_name
+                            )[4]
+                            or "9999-99-99"
+                        ),
+                        catalog_sort_key(entry_name)[5],
+                    )
+                )
+
+            else:
+                display_entries.sort(
+                    key=lambda entry_name: (
+                        catalog_sort_key(entry_name)[0],
+                        catalog_sort_key(entry_name)[2],
+                        catalog_sort_key(entry_name)[3],
+                        catalog_sort_key(entry_name)[4],
+                        catalog_sort_key(entry_name)[5],
+                    )
+                )
+
+        total_items = len(display_entries)
+
+        search_suffix = ""
+
+        if search_query:
+            search_suffix += "&q=" + quote(search_query)
+
+        if reading_filter != "all":
+            search_suffix += "&reading=" + quote(reading_filter)
+
+        if language_filter != "all":
+            search_suffix += "&language=" + quote(language_filter)
+
+        if author_filter:
+            search_suffix += (
+                "&author="
+                + quote(author_filter)
+            )
+
+        if series_filter:
+            search_suffix += (
+                "&series="
+                + quote(series_filter)
+            )
+
+        if sort_mode != "default":
+            search_suffix += (
+                "&sort="
+                + quote(sort_mode)
+            )
+
+        if catalog_mode == "series":
+            search_suffix += "&catalog=series"
+
+        for selected_tag in selected_tags:
+            search_suffix += (
+                "&tag="
+                + quote(selected_tag)
+            )
+
+        total_pages = max(
+            1,
+            (total_items + items_per_page - 1)
+            // items_per_page,
+        )
+
+        current_page = min(current_page, total_pages)
+
+        if view_mode == "page":
+            page_start = (
+                current_page - 1
+            ) * items_per_page
+            page_end = page_start + items_per_page
+            entries = display_entries[page_start:page_end]
+        else:
+            entries = display_entries
+
+        metadata_series_select_options_html = "".join(
+            '<option value="'
+            + html.escape(
+                series_value,
+                quote=True,
+            )
+            + '">'
+            + html.escape(series_value)
+            + "</option>"
+            for series_value in sorted(
+                available_series,
+                key=str.casefold,
+            )
+        )
+
+        metadata_tag_select_options_html = "".join(
+            '<option value="'
+            + html.escape(
+                tag_value,
+                quote=True,
+            )
+            + '">'
+            + html.escape(tag_value)
+            + "</option>"
+            for tag_value in sorted(
+                available_tags,
+                key=str.casefold,
+            )
+        )
+
+        cards = []
+        visible_count = 0
+
+        if request_path != "/":
+            parent_path = posixpath.dirname(
+                request_path.rstrip("/")
+            )
+
+            if not parent_path or parent_path == ".":
+                parent_path = "/"
+            else:
+                parent_path = parent_path.rstrip("/") + "/"
+
+                if not parent_path.startswith("/"):
+                    parent_path = "/" + parent_path
+
+            parent_url = (
+                quote(parent_path, safe="/")
+                + f"?view={view_mode}"
+            )
+
+            cards.append(
+                f"""
+                <a class="book-card folder-card"
+                   href="{html.escape(parent_url)}">
+                    <div class="type-icon">↩</div>
+                    <div class="book-info">
+                        <div class="book-title">상위 폴더</div>
+                        <div class="book-meta">뒤로 가기</div>
+                    </div>
+                    <div class="open-button">열기</div>
+                </a>
+                """
+            )
+
+        for name in entries:
+            if name.startswith("."):
+                continue
+
+            # Moon+ Reader가 만든 내부 폴더는 서재 목록에서 숨김
+            if name.casefold() == "moonreader":
+                continue
+
+            full_path = os.path.join(path, name)
+            encoded_name = quote(name)
+
+            if os.path.isdir(full_path):
+                folder_url = (
+                    encoded_name
+                    + "/"
+                    + f"?view={view_mode}"
+                )
+
+                cards.append(
+                    f"""
+                    <a class="book-card folder-card searchable"
+                       href="{html.escape(folder_url)}"
+                       data-kind="folder"
+                       data-name="{html.escape(name.casefold())}">
+                        <div class="type-icon">DIR</div>
+                        <div class="book-info">
+                            <div class="book-title">
+                                {html.escape(name)}
+                            </div>
+                            <div class="book-meta">폴더</div>
+                        </div>
+                        <div class="open-button">열기</div>
+                    </a>
+                    """
+                )
+
+                visible_count += 1
+                continue
+
+            extension = os.path.splitext(name)[1].lower()
+
+            if extension not in BOOK_TYPES:
+                continue
+
+            label, _ = BOOK_TYPES[extension]
+            size = os.path.getsize(full_path)
+            modified = datetime.fromtimestamp(
+                os.path.getmtime(full_path)
+            ).strftime("%Y-%m-%d %H:%M")
+
+            relative_path = posixpath.join(
+                request_path.lstrip("/"),
+                name,
+            )
+
+            download_path = "/download/" + quote(
+                relative_path,
+                safe="/",
+            )
+
+            card_id = f"book-{visible_count}"
+            entry_path = os.path.join(path, name)
+
+            download_history = get_download_history(
+                self.client_address[0],
+                entry_path,
+            )
+            download_history_text = format_download_history(
+                download_history
+            )
+
+            reading_status = get_reading_status(entry_path)
+            reading_state = reading_status.get("status", "unread")
+            finished_at = reading_status.get("finished_at", "")
+            book_note = get_book_note(entry_path)
+
+            reading_return_url = self.path
+
+            unread_status_url = (
+                "/reading-status?path="
+                + quote(relative_path, safe="")
+                + "&status=unread"
+                + "&return="
+                + quote(reading_return_url, safe="")
+            )
+
+            finished_status_url = (
+                "/reading-status?path="
+                + quote(relative_path, safe="")
+                + "&status=finished"
+                + "&return="
+                + quote(reading_return_url, safe="")
+            )
+
+            metadata = metadata_by_name.get(name, {})
+
+            book_title = str(
+                metadata.get("title", "")
+            ).strip()
+
+            book_author = str(
+                metadata.get("author", "")
+            ).strip()
+
+            book_language_code = str(
+                metadata.get("language", "")
+            ).strip()
+
+            book_series = str(
+                metadata.get("series", "")
+            ).strip()
+
+            book_series_index = str(
+                metadata.get("series_index", "")
+            ).strip()
+
+            book_published_at = str(
+                metadata.get("published_at", "")
+            ).strip()
+
+            book_tags = normalize_book_tags(
+                metadata.get("tags", [])
+            )
+
+            book_tags_text = ", ".join(
+                book_tags
+            )
+
+            if not book_title:
+                book_title = os.path.splitext(name)[0]
+
+            if not book_author:
+                book_author = "저자 정보 없음"
+
+            language_labels = {
+                "ko": "한국어",
+                "ko-KR": "한국어",
+                "en": "영어",
+                "en-US": "영어",
+                "en-GB": "영어",
+                "ja": "일본어",
+                "ja-JP": "일본어",
+            }
+
+            if book_language_code:
+                book_language = language_labels.get(
+                    book_language_code,
+                    book_language_code,
+                )
+            else:
+                book_language = "언어 정보 없음"
+
+            selected_language_base = (
+                book_language_code
+                .lower()
+                .split("-", 1)[0]
+                .split("_", 1)[0]
+            )
+
+            metadata_language_choices = [
+                ("", "언어 정보 없음"),
+                ("ko", "한국어"),
+                ("en", "영어"),
+                ("ja", "일본어"),
+            ]
+
+            known_language_values = {
+                value
+                for value, label_text
+                in metadata_language_choices
+            }
+
+            if (
+                selected_language_base
+                and selected_language_base
+                not in known_language_values
+            ):
+                metadata_language_choices.append(
+                    (
+                        book_language_code,
+                        book_language_code,
+                    )
+                )
+
+            metadata_language_options = []
+
+            for (
+                language_value,
+                language_label,
+            ) in metadata_language_choices:
+                normalized_value = (
+                    language_value
+                    .lower()
+                    .split("-", 1)[0]
+                    .split("_", 1)[0]
+                )
+
+                selected = ""
+
+                if normalized_value == selected_language_base:
+                    selected = " selected"
+
+                if (
+                    not language_value
+                    and not selected_language_base
+                ):
+                    selected = " selected"
+
+                metadata_language_options.append(
+                    '<option value="'
+                    + html.escape(
+                        language_value,
+                        quote=True,
+                    )
+                    + '"'
+                    + selected
+                    + ">"
+                    + html.escape(language_label)
+                    + "</option>"
+                )
+
+            metadata_language_options_html = "".join(
+                metadata_language_options
+            )
+
+            metadata_title_input = html.escape(
+                book_title,
+                quote=True,
+            )
+
+            metadata_author_input = html.escape(
+                (
+                    ""
+                    if book_author == "저자 정보 없음"
+                    else book_author
+                ),
+                quote=True,
+            )
+
+            metadata_series_input = html.escape(
+                book_series,
+                quote=True,
+            )
+
+            metadata_series_index_input = html.escape(
+                book_series_index,
+                quote=True,
+            )
+
+            metadata_published_at_input = html.escape(
+                book_published_at,
+                quote=True,
+            )
+
+            metadata_tags_input = html.escape(
+                book_tags_text,
+                quote=True,
+            )
+
+            encoded_metadata_path = html.escape(
+                quote(relative_path, safe=""),
+                quote=True,
+            )
+
+            author_can_favorite = (
+                bool(book_author)
+                and book_author != "저자 정보 없음"
+            )
+
+            author_is_favorite = (
+                author_can_favorite
+                and is_favorite_author(book_author)
+            )
+
+            series_can_favorite = bool(book_series)
+
+            series_is_favorite = (
+                series_can_favorite
+                and is_favorite_series(
+                    book_author
+                    if author_can_favorite
+                    else "",
+                    book_series,
+                )
+            )
+
+            author_favorite_symbol = (
+                "★"
+                if author_is_favorite
+                else "☆"
+            )
+
+            series_favorite_symbol = (
+                "★"
+                if series_is_favorite
+                else "☆"
+            )
+
+            encoded_favorite_author = html.escape(
+                quote(
+                    (
+                        book_author
+                        if author_can_favorite
+                        else ""
+                    ),
+                    safe="",
+                ),
+                quote=True,
+            )
+
+            encoded_favorite_series = html.escape(
+                quote(book_series, safe=""),
+                quote=True,
+            )
+
+            if reading_state == "finished":
+                reading_status_class = " finished"
+                reading_status_label = "✓ 완독"
+
+                if finished_at:
+                    short_finished_at = finished_at[5:]
+                    reading_status_label += " · " + short_finished_at
+            else:
+                reading_status_class = " unread"
+                reading_status_label = "미독"
+
+            if reading_state == "unread" and request_path != "/":
+                reading_status_html = ""
+            else:
+                reading_status_html = f"""
+                        <span id="{card_id}-reading-status"
+                              class="reading-status{reading_status_class}">
+                            {html.escape(reading_status_label)}
+                        </span>
+                """
+
+            note_has_value = bool(book_note.strip())
+            note_input_class = (
+                "book-note-input saved"
+                if note_has_value
+                else "book-note-input hidden"
+            )
+            note_readonly = " readonly" if note_has_value else ""
+            note_button_label = (
+                "수정"
+                if note_has_value
+                else "메모 작성"
+            )
+
+            reading_detail_html = f"""
+                    <div class="book-extra">
+                        <div class="book-extra-row">
+                            <strong>제목</strong>
+                            <span>{html.escape(book_title)}</span>
+                        </div>
+
+                        <div class="book-extra-row catalog-value-row">
+                            <strong>저자</strong>
+
+                            <span class="catalog-value">
+                                {html.escape(book_author)}
+                            </span>
+
+                            {
+                                f"""
+                                <button
+                                    id="{card_id}-favorite-author"
+                                    class="catalog-favorite-button{
+                                        ' active'
+                                        if author_is_favorite
+                                        else ''
+                                    }"
+                                    type="button"
+                                    title="저자 즐겨찾기"
+                                    onclick="toggleCatalogFavorite(
+                                        '{card_id}',
+                                        'author',
+                                        '{encoded_favorite_author}',
+                                        '',
+                                        this
+                                    )">
+                                    {author_favorite_symbol}
+                                </button>
+                                """
+                                if author_can_favorite
+                                else ""
+                            }
+                        </div>
+
+                        <div class="book-extra-row">
+                            <strong>언어</strong>
+                            <span id="{card_id}-display-language">{html.escape(book_language)}</span>
+                        </div>
+
+                        <div class="book-extra-row catalog-value-row">
+                            <strong>시리즈</strong>
+
+                            <span
+                                id="{card_id}-display-series"
+                                class="catalog-value">
+                                {html.escape(book_series or "-")}
+                            </span>
+
+                            {
+                                f"""
+                                <button
+                                    id="{card_id}-favorite-series"
+                                    data-favorite-type="series"
+                                    data-favorite-series="{encoded_favorite_series}"
+                                    class="catalog-favorite-button{
+                                        ' active'
+                                        if series_is_favorite
+                                        else ''
+                                    }"
+                                    type="button"
+                                    title="시리즈 즐겨찾기"
+                                    onclick="toggleCatalogFavorite(
+                                        '{card_id}',
+                                        'series',
+                                        '{encoded_favorite_author}',
+                                        '{encoded_favorite_series}',
+                                        this
+                                    )">
+                                    {series_favorite_symbol}
+                                </button>
+                                """
+                                if series_can_favorite
+                                else ""
+                            }
+                        </div>
+
+                        <div class="book-extra-row">
+                            <strong>권차</strong>
+                            <span id="{card_id}-display-series-index">{html.escape(book_series_index or "-")}</span>
+                        </div>
+
+                        <div class="book-extra-row">
+                            <strong>출간일</strong>
+                            <span id="{card_id}-display-published-at">{html.escape(book_published_at or "-")}</span>
+                        </div>
+
+                        <div class="book-extra-row">
+                            <strong>태그</strong>
+                            <span id="{card_id}-display-tags">{html.escape(book_tags_text or "-")}</span>
+                        </div>
+
+                        <div class="metadata-editor-area">
+                            <button
+                                class="metadata-edit-toggle"
+                                type="button"
+                                onclick="
+                                    var editor =
+                                        this.nextElementSibling;
+
+                                    if (editor) {{
+                                        editor.classList.toggle(
+                                            'hidden'
+                                        );
+
+                                        if (
+                                            !editor.classList.contains(
+                                                'hidden'
+                                            )
+                                            && typeof renderMetadataTagChips
+                                                === 'function'
+                                        ) {{
+                                            renderMetadataTagChips(
+                                                '{card_id}'
+                                            );
+                                        }}
+                                    }}
+                                ">
+                                메타데이터 수정
+                            </button>
+
+                            <div
+                                id="{card_id}-metadata-editor"
+                                class="metadata-editor hidden">
+
+                                <label>
+                                    <span>제목</span>
+
+                                    <input
+                                        id="{card_id}-metadata-title"
+                                        class="metadata-input"
+                                        type="text"
+                                        maxlength="300"
+                                        value="{metadata_title_input}">
+                                </label>
+
+                                <label>
+                                    <span>저자</span>
+
+                                    <input
+                                        id="{card_id}-metadata-author"
+                                        class="metadata-input"
+                                        type="text"
+                                        maxlength="300"
+                                        value="{metadata_author_input}">
+                                </label>
+
+                                <label>
+                                    <span>언어</span>
+
+                                    <select
+                                        id="{card_id}-metadata-language"
+                                        class="metadata-input metadata-select">
+                                        {metadata_language_options_html}
+                                    </select>
+                                </label>
+
+                                <label>
+                                    <span>시리즈</span>
+
+                                    <input
+                                        id="{card_id}-metadata-series"
+                                        class="metadata-input"
+                                        type="text"
+                                        maxlength="300"
+                                        value="{metadata_series_input}"
+                                        placeholder="새 시리즈 직접 입력">
+
+                                    <select
+                                        class="metadata-input metadata-existing-select"
+                                        aria-label="기존 시리즈 선택"
+                                        onchange="
+                                            if (this.value) {{
+                                                document.getElementById(
+                                                    '{card_id}-metadata-series'
+                                                ).value = this.value;
+                                            }}
+                                        ">
+                                        <option value="">
+                                            기존 시리즈 선택
+                                        </option>
+                                        {metadata_series_select_options_html}
+                                    </select>
+                                </label>
+
+                                <label>
+                                    <span>권차</span>
+
+                                    <input
+                                        id="{card_id}-metadata-series-index"
+                                        class="metadata-input"
+                                        type="number"
+                                        min="0"
+                                        step="0.1"
+                                        value="{metadata_series_index_input}"
+                                        placeholder="예: 1">
+                                </label>
+
+                                <label>
+                                    <span>출간일</span>
+
+                                    <input
+                                        id="{card_id}-metadata-published-at"
+                                        class="metadata-input"
+                                        type="text"
+                                        maxlength="32"
+                                        value="{metadata_published_at_input}"
+                                        placeholder="예: 1954-07-29">
+                                </label>
+
+                                <div class="metadata-tags-editor">
+                                    <span class="metadata-tags-label">
+                                        태그
+                                    </span>
+
+                                    <input
+                                        id="{card_id}-metadata-tags"
+                                        type="hidden"
+                                        value="{metadata_tags_input}">
+
+                                    <div
+                                        id="{card_id}-metadata-tag-chips"
+                                        class="metadata-tag-chips"
+                                        data-card-id="{card_id}">
+                                    </div>
+
+                                    <div class="metadata-tag-picker">
+                                        <input
+                                            id="{card_id}-metadata-tag-add"
+                                            class="metadata-input"
+                                            type="text"
+                                            maxlength="80"
+                                            placeholder="새 태그 직접 입력"
+                                            onkeydown="
+                                                if (event.key === 'Enter') {{
+                                                    event.preventDefault();
+                                                    addMetadataTag(
+                                                        '{card_id}'
+                                                    );
+                                                }}
+                                            ">
+
+                                        <select
+                                            id="{card_id}-metadata-tag-select"
+                                            class="metadata-input metadata-existing-select"
+                                            aria-label="기존 태그 선택">
+                                            <option value="">
+                                                기존 태그 선택
+                                            </option>
+                                            {metadata_tag_select_options_html}
+                                        </select>
+
+                                        <button
+                                            class="metadata-tag-add-button"
+                                            type="button"
+                                            onclick="addMetadataTag(
+                                                '{card_id}'
+                                            )">
+                                            추가
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="metadata-editor-actions">
+                                    <span
+                                        id="{card_id}-metadata-result"
+                                        class="metadata-result"></span>
+
+                                    <button
+                                        class="metadata-reset-button"
+                                        type="button"
+                                        onclick="
+                                            event.preventDefault();
+                                            event.stopPropagation();
+
+                                            resetBookMetadata(
+                                                '{card_id}',
+                                                '{encoded_metadata_path}'
+                                            );
+
+                                            return false;
+                                        ">
+                                        원본 복원
+                                    </button>
+
+                                    <button
+                                        class="metadata-save-button"
+                                        type="button"
+                                        onclick="
+                                            event.preventDefault();
+                                            event.stopPropagation();
+
+                                            saveBookMetadata(
+                                                '{card_id}',
+                                                '{encoded_metadata_path}'
+                                            );
+
+                                            return false;
+                                        ">
+                                        저장
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="book-extra-row status-select-row">
+                            <strong>상태</strong>
+
+                            <div class="status-options">
+                                <a class="status-option unread-option"
+                                   href="{html.escape(unread_status_url, quote=True)}"
+                                   onclick="return setReadingStatus(
+                                       '{card_id}',
+                                       this.href,
+                                       'unread'
+                                   )">
+                                    미독
+                                </a>
+
+                                <a class="status-option finished-option"
+                                   href="{html.escape(finished_status_url, quote=True)}"
+                                   onclick="return setReadingStatus(
+                                       '{card_id}',
+                                       this.href,
+                                       'finished'
+                                   )">
+                                    완독
+                                </a>
+                            </div>
+                        </div>
+
+                        <div class="book-extra-row">
+                            <strong>완독일</strong>
+                            <span id="{card_id}-finished-at">
+                                {html.escape(finished_at or "-")}
+                            </span>
+                        </div>
+
+                        <div class="book-note-area">
+                            <textarea id="{card_id}-note"
+                                      class="{note_input_class}"
+                                      maxlength="2000"
+                                      rows="4"
+                                      placeholder="책에 대한 짧은 메모"
+                                      {note_readonly}>{html.escape(book_note)}</textarea>
+
+                            <div class="book-note-actions">
+                                <span id="{card_id}-note-result"
+                                      class="book-note-result"></span>
+
+                                <button id="{card_id}-note-button"
+                                        class="book-note-save"
+                                        type="button"
+                                        onclick="toggleBookNoteEditor(
+                                            '{card_id}',
+                                            '{html.escape(quote(relative_path, safe=""), quote=True)}'
+                                        )">
+                                    {note_button_label}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+            """
+
+            book_client_search_text = " ".join(
+                (
+                    name,
+                    book_title,
+                    (
+                        ""
+                        if book_author == "저자 정보 없음"
+                        else book_author
+                    ),
+                    book_series,
+                    book_tags_text,
+                )
+            ).casefold()
+
+            if download_history_text:
+                downloaded_class = " downloaded"
+                downloaded_badge_html = """
+                <div class="downloaded-badge">
+                    ✓ 받음
+                </div>
+                """
+                download_history_html = f"""
+                <div class="download-history">
+                    {html.escape(download_history_text)}
+                </div>
+                """
+            else:
+                downloaded_class = ""
+                downloaded_badge_html = ""
+                download_history_html = ""
+
+            cards.append(
+                f"""
+                <article class="book-card searchable{downloaded_class}"
+                         data-kind="book"
+                         data-reading-status="{html.escape(reading_state)}"
+                         data-name="{html.escape(
+                             book_client_search_text,
+                             quote=True,
+                         )}">
+                    {downloaded_badge_html}
+
+                    <details class="book-details">
+                        <summary class="book-summary">
+                            <div class="type-icon">{html.escape(label)}</div>
+
+                            <div class="book-info">
+                                <div
+                                    id="{card_id}-display-title"
+                                    class="book-title">
+                                    {html.escape(book_title)}
+                                </div>
+
+                                <div class="book-meta">
+                                    {html.escape(book_author)}
+                                </div>
+
+                                <div id="{card_id}-progress"
+                                     class="progress-area hidden">
+                                    <div class="progress-track">
+                                        <div id="{card_id}-bar"
+                                             class="progress-bar"></div>
+                                    </div>
+
+                                    <div class="progress-row">
+                                        <span id="{card_id}-text">
+                                            다운로드 준비 중
+                                        </span>
+                                        <strong id="{card_id}-percent">0%</strong>
+                                    </div>
+                                </div>
+                            </div>
+                        </summary>
+
+                        {reading_detail_html}
+                    </details>
+
+                    <div class="card-actions">
+                        <button id="{card_id}-download"
+                                class="download-button"
+                                type="button"
+                                onclick="startDownload(
+                                    '{card_id}',
+                                    '{html.escape(download_path, quote=True)}',
+                                    '{html.escape(name, quote=True)}'
+                                )">
+                            받기
+                        </button>
+
+                        {reading_status_html}
+
+                        {download_history_html}
+
+                        <button id="{card_id}-cancel"
+                                class="cancel-button hidden"
+                                type="button"
+                                onclick="cancelDownload('{card_id}')">
+                            취소
+                        </button>
+                    </div>
+                </article>
+                """
+            )
+
+            visible_count += 1
+
+        card_html = "".join(cards)
+
+        encoded_base_path = quote(
+            request_path,
+            safe="/",
+        )
+
+        if view_mode == "scroll":
+            switch_url = (
+                encoded_base_path
+                + "?view=page&page=1"
+                + search_suffix
+            )
+            switch_label = "페이지 보기"
+        else:
+            switch_url = (
+                encoded_base_path
+                + "?view=scroll"
+                + search_suffix
+            )
+            switch_label = "스크롤 보기"
+
+        view_controls = f"""
+        <div class="view-controls">
+            <a class="view-button"
+               href="{switch_url}">
+                {switch_label}
+            </a>
+        </div>
+        """
+
+        filter_base_path = quote(request_path, safe="/")
+        filter_search_suffix = ""
+
+        if search_query:
+            filter_search_suffix += "&q=" + quote(search_query)
+
+        if language_filter != "all":
+            filter_search_suffix += (
+                "&language=" + quote(language_filter)
+            )
+
+        all_filter_class = (
+            " active"
+            if (
+                reading_filter == "all"
+                and catalog_mode != "series"
+            )
+            else ""
+        )
+
+        unread_filter_class = (
+            " active"
+            if (
+                reading_filter == "unread"
+                and catalog_mode != "series"
+            )
+            else ""
+        )
+
+        finished_filter_class = (
+            " active"
+            if (
+                reading_filter == "finished"
+                and catalog_mode != "series"
+            )
+            else ""
+        )
+
+        series_filter_class = (
+            " active"
+            if catalog_mode == "series"
+            else ""
+        )
+
+        regular_filter_suffix = ""
+
+        if search_query:
+            regular_filter_suffix += (
+                "&q=" + quote(search_query)
+            )
+
+        if language_filter != "all":
+            regular_filter_suffix += (
+                "&language="
+                + quote(language_filter)
+            )
+
+        series_tab_parts = [
+            "view=" + quote(view_mode),
+            "catalog=series",
+            "sort=series",
+        ]
+
+        if search_query:
+            series_tab_parts.append(
+                "q=" + quote(search_query)
+            )
+
+        if language_filter != "all":
+            series_tab_parts.append(
+                "language="
+                + quote(language_filter)
+            )
+
+        series_tab_url = (
+            filter_base_path
+            + "?"
+            + "&".join(series_tab_parts)
+        )
+
+        reading_filter_html = f"""
+        <div class="reading-filter"
+             role="navigation"
+             aria-label="서재 보기 필터">
+
+            <a class="reading-filter-button{all_filter_class}"
+               href="{filter_base_path}?view={view_mode}{regular_filter_suffix}">
+                전체
+            </a>
+
+            <a class="reading-filter-button{unread_filter_class}"
+               href="{filter_base_path}?view={view_mode}&reading=unread{regular_filter_suffix}">
+                미독
+            </a>
+
+            <a class="reading-filter-button{finished_filter_class}"
+               href="{filter_base_path}?view={view_mode}&reading=finished{regular_filter_suffix}">
+                완독
+            </a>
+
+            <a class="reading-filter-button{series_filter_class}"
+               href="{html.escape(series_tab_url, quote=True)}">
+                시리즈
+            </a>
+        </div>
+        """
+
+        language_labels = {
+            "all": (
+                "모든 언어 ("
+                + str(language_counts.get("all", 0))
+                + ")"
+            ),
+            "ko": (
+                "한국어 ("
+                + str(language_counts.get("ko", 0))
+                + ")"
+            ),
+            "en": (
+                "영어 ("
+                + str(language_counts.get("en", 0))
+                + ")"
+            ),
+            "ja": (
+                "일본어 ("
+                + str(language_counts.get("ja", 0))
+                + ")"
+            ),
+        }
+
+        language_options = []
+
+        for language_value, language_label in language_labels.items():
+            selected = (
+                " selected"
+                if language_filter == language_value
+                else ""
+            )
+
+            language_options.append(
+                '<option value="'
+                + html.escape(language_value, quote=True)
+                + '"'
+                + selected
+                + ">"
+                + html.escape(language_label)
+                + "</option>"
+            )
+
+        series_options = [
+            '<option value="">시리즈 전체</option>'
+        ]
+
+        for series_value in sorted(
+            available_series,
+            key=str.casefold,
+        ):
+            selected = (
+                " selected"
+                if series_value == series_filter
+                else ""
+            )
+
+            series_options.append(
+                '<option value="'
+                + html.escape(
+                    series_value,
+                    quote=True,
+                )
+                + '"'
+                + selected
+                + ">"
+                + html.escape(series_value)
+                + " ("
+                + str(
+                    available_series[
+                        series_value
+                    ]
+                )
+                + ")</option>"
+            )
+
+        sort_labels = [
+            ("series", "시리즈 권차순"),
+            ("published", "출간순"),
+            ("default", "기본순"),
+        ]
+
+        sort_options = []
+
+        for sort_value, sort_label in sort_labels:
+            selected = (
+                " selected"
+                if sort_value == sort_mode
+                else ""
+            )
+
+            sort_options.append(
+                '<option value="'
+                + html.escape(
+                    sort_value,
+                    quote=True,
+                )
+                + '"'
+                + selected
+                + ">"
+                + html.escape(sort_label)
+                + "</option>"
+            )
+
+        def build_catalog_query(
+            series_value=None,
+            tag_values=None,
+            sort_value=None,
+        ):
+            query_parts = [
+                "view=" + quote(view_mode),
+                "catalog=series",
+            ]
+
+            if reading_filter != "all":
+                query_parts.append(
+                    "reading="
+                    + quote(reading_filter)
+                )
+
+            if language_filter != "all":
+                query_parts.append(
+                    "language="
+                    + quote(language_filter)
+                )
+
+            if search_query:
+                query_parts.append(
+                    "q=" + quote(search_query)
+                )
+
+            final_series = (
+                series_filter
+                if series_value is None
+                else series_value
+            )
+
+            if final_series:
+                query_parts.append(
+                    "series="
+                    + quote(final_series)
+                )
+
+            final_tags = (
+                selected_tags
+                if tag_values is None
+                else tag_values
+            )
+
+            for tag_value in final_tags:
+                query_parts.append(
+                    "tag=" + quote(tag_value)
+                )
+
+            final_sort = (
+                sort_mode
+                if sort_value is None
+                else sort_value
+            )
+
+            if final_sort:
+                query_parts.append(
+                    "sort="
+                    + quote(final_sort)
+                )
+
+            return (
+                filter_base_path
+                + "?"
+                + "&".join(query_parts)
+            )
+
+        tag_buttons = []
+
+        selected_tag_keys = {
+            tag.casefold()
+            for tag in selected_tags
+        }
+
+        for tag_value in sorted(
+            available_tags,
+            key=str.casefold,
+        ):
+            tag_is_selected = (
+                tag_value.casefold()
+                in selected_tag_keys
+            )
+
+            if tag_is_selected:
+                next_tags = [
+                    tag
+                    for tag in selected_tags
+                    if (
+                        tag.casefold()
+                        != tag_value.casefold()
+                    )
+                ]
+            else:
+                next_tags = (
+                    list(selected_tags)
+                    + [tag_value]
+                )
+
+            tag_class = (
+                " selected"
+                if tag_is_selected
+                else ""
+            )
+
+            tag_mark = (
+                "✓ "
+                if tag_is_selected
+                else ""
+            )
+
+            encoded_tag_value = html.escape(
+                quote(tag_value, safe=""),
+                quote=True,
+            )
+
+            tag_is_favorite = is_favorite_tag(
+                tag_value
+            )
+
+            tag_favorite_symbol = (
+                "★"
+                if tag_is_favorite
+                else "☆"
+            )
+
+            tag_buttons.append(
+                '<span class="catalog-tag-item">'
+                '<a class="catalog-tag-button'
+                + (
+                    " active"
+                    if tag_value in selected_tags
+                    else ""
+                )
+                + '" href="'
+                + html.escape(
+                    build_catalog_query(
+                        tag_values=next_tags
+                    ),
+                    quote=True,
+                )
+                + '">'
+                + tag_mark
+                + html.escape(tag_value)
+                + " ("
+                + str(
+                    available_tags[tag_value]
+                )
+                + ')</a>'
+                '<button'
+                ' class="catalog-tag-favorite-button'
+                + (
+                    " active"
+                    if tag_is_favorite
+                    else ""
+                )
+                + '"'
+                ' type="button"'
+                ' data-favorite-tag="'
+                + encoded_tag_value
+                + '"'
+                ' title="태그 즐겨찾기"'
+                ' onclick="toggleCatalogTagFavorite(this)">'
+                + tag_favorite_symbol
+                + '</button>'
+                '</span>'
+            )
+
+        if selected_tags:
+            clear_tags_html = (
+                '<a class="catalog-tag-clear" href="'
+                + html.escape(
+                    build_catalog_query(
+                        tag_values=[]
+                    ),
+                    quote=True,
+                )
+                + '">태그 해제</a>'
+            )
+        else:
+            clear_tags_html = ""
+
+        if tag_buttons:
+            tag_filter_html = (
+                '<div class="catalog-tag-list">'
+                + "".join(tag_buttons)
+                + clear_tags_html
+                + "</div>"
+            )
+        else:
+            tag_filter_html = (
+                '<div class="catalog-tag-empty">'
+                '등록된 태그 없음'
+                '</div>'
+            )
+
+        catalog_filter_html = ""
+
+        if catalog_mode == "series":
+            catalog_filter_html = f"""
+            <section class="catalog-filter-panel">
+                <form class="catalog-filter"
+                      method="get"
+                      action="{filter_base_path}">
+
+                    <input type="hidden"
+                           name="view"
+                           value="{html.escape(view_mode)}">
+
+                    <input type="hidden"
+                           name="catalog"
+                           value="series">
+
+                    <input type="hidden"
+                           name="reading"
+                           value="{html.escape(reading_filter)}">
+
+                    <input type="hidden"
+                           name="language"
+                           value="{html.escape(language_filter)}">
+
+                    <input type="hidden"
+                           name="q"
+                           value="{html.escape(search_query, quote=True)}">
+
+                    {
+                        "".join(
+                            '<input type="hidden" name="tag" value="'
+                            + html.escape(tag, quote=True)
+                            + '">'
+                            for tag in selected_tags
+                        )
+                    }
+
+                    <label>
+                        <span>시리즈</span>
+
+                        <select name="series"
+                                onchange="this.form.submit()">
+                            {"".join(series_options)}
+                        </select>
+                    </label>
+
+                    <label>
+                        <span>정렬</span>
+
+                        <select name="sort"
+                                onchange="this.form.submit()">
+                            {"".join(sort_options)}
+                        </select>
+                    </label>
+                </form>
+
+                <div class="catalog-tag-section">
+                    <strong>태그</strong>
+                    {tag_filter_html}
+                </div>
+            </section>
+            """
+
+        favorite_links = []
+
+        with CATALOG_FAVORITES_LOCK:
+            favorite_authors = list(
+                CATALOG_FAVORITES.get(
+                    "authors",
+                    [],
+                )
+            )
+
+            favorite_series_items = [
+                dict(item)
+                for item in CATALOG_FAVORITES.get(
+                    "series",
+                    [],
+                )
+                if isinstance(item, dict)
+            ]
+
+            favorite_tags = list(
+                CATALOG_FAVORITES.get(
+                    "tags",
+                    [],
+                )
+            )
+
+        def favorite_catalog_url(
+            author_value="",
+            series_value="",
+            tag_value="",
+            favorite_sort="default",
+            standalone=False,
+        ):
+            query_parts = [
+                "view=" + quote(view_mode),
+            ]
+
+            if not standalone:
+                if search_query:
+                    query_parts.append(
+                        "q=" + quote(search_query)
+                    )
+
+                if reading_filter != "all":
+                    query_parts.append(
+                        "reading="
+                        + quote(reading_filter)
+                    )
+
+                if language_filter != "all":
+                    query_parts.append(
+                        "language="
+                        + quote(language_filter)
+                    )
+
+            if author_value:
+                query_parts.append(
+                    "author="
+                    + quote(author_value)
+                )
+
+            if series_value or tag_value:
+                query_parts.append(
+                    "catalog=series"
+                )
+
+            if series_value:
+                query_parts.append(
+                    "series="
+                    + quote(series_value)
+                )
+
+            favorite_tag_values = (
+                []
+                if standalone
+                else list(selected_tags)
+            )
+
+            if tag_value:
+                normalized_tag_value = normalize_catalog_value(
+                    tag_value
+                )
+
+                if normalized_tag_value:
+                    existing_tag_keys = {
+                        normalize_catalog_value(tag).casefold()
+                        for tag in favorite_tag_values
+                    }
+
+                    if (
+                        normalized_tag_value.casefold()
+                        not in existing_tag_keys
+                    ):
+                        favorite_tag_values.append(
+                            normalized_tag_value
+                        )
+
+            for favorite_tag_value in favorite_tag_values:
+                query_parts.append(
+                    "tag="
+                    + quote(favorite_tag_value)
+                )
+
+            if (
+                series_value
+                and favorite_sort == "default"
+            ):
+                favorite_sort = "series"
+
+            if favorite_sort != "default":
+                query_parts.append(
+                    "sort="
+                    + quote(favorite_sort)
+                )
+
+            return (
+                encoded_base_path
+                + "?"
+                + "&".join(query_parts)
+            )
+
+        for favorite_author in favorite_authors:
+            favorite_author = str(
+                favorite_author
+            ).strip()
+
+            if not favorite_author:
+                continue
+
+            favorite_links.append(
+                '<a class="catalog-favorite-link" href="'
+                + html.escape(
+                    favorite_catalog_url(
+                        author_value=(
+                            favorite_author
+                        ),
+                        favorite_sort="author",
+                    ),
+                    quote=True,
+                )
+                + '">★ '
+                + html.escape(favorite_author)
+                + "</a>"
+            )
+
+        for favorite_item in favorite_series_items:
+            favorite_author = str(
+                favorite_item.get(
+                    "author",
+                    "",
+                )
+            ).strip()
+
+            favorite_series = str(
+                favorite_item.get(
+                    "series",
+                    "",
+                )
+            ).strip()
+
+            if not favorite_series:
+                continue
+
+            encoded_remove_author = quote(
+                favorite_author,
+                safe="",
+            )
+
+            encoded_remove_series = quote(
+                favorite_series,
+                safe="",
+            )
+
+            favorite_links.append(
+                '<span class="catalog-favorite-item series"'
+                ' data-favorite-author="'
+                + html.escape(
+                    encoded_remove_author,
+                    quote=True,
+                )
+                + '"'
+                ' data-favorite-series="'
+                + html.escape(
+                    encoded_remove_series,
+                    quote=True,
+                )
+                + '">'
+                '<a class="catalog-favorite-link series" href="'
+                + html.escape(
+                    favorite_catalog_url(
+                        series_value=(
+                            favorite_series
+                        ),
+                        favorite_sort="series",
+                        standalone=True,
+                    ),
+                    quote=True,
+                )
+                + '">★ '
+                + html.escape(favorite_series)
+                + '</a>'
+                '<button'
+                ' class="catalog-favorite-remove"'
+                ' type="button"'
+                ' title="시리즈 즐겨찾기 삭제"'
+                ' aria-label="시리즈 즐겨찾기 삭제"'
+                ' onclick="confirmAndDeleteCatalogFavorite(this)">×</button>'
+                '</span>'
+            )
+
+        for favorite_tag in favorite_tags:
+            favorite_tag = normalize_catalog_value(
+                favorite_tag
+            )
+
+            if not favorite_tag:
+                continue
+
+            encoded_remove_tag = quote(
+                favorite_tag,
+                safe="",
+            )
+
+            favorite_links.append(
+                '<span class="catalog-favorite-item tag"'
+                ' data-favorite-tag="'
+                + html.escape(
+                    encoded_remove_tag,
+                    quote=True,
+                )
+                + '">'
+                '<a class="catalog-favorite-link tag" href="'
+                + html.escape(
+                    favorite_catalog_url(
+                        tag_value=favorite_tag,
+                        standalone=True,
+                    ),
+                    quote=True,
+                )
+                + '">★ #'
+                + html.escape(favorite_tag)
+                + '</a>'
+                '<button'
+                ' class="catalog-favorite-remove"'
+                ' type="button"'
+                ' title="태그 즐겨찾기 삭제"'
+                ' aria-label="태그 즐겨찾기 삭제"'
+                ' onclick="confirmAndDeleteCatalogFavorite(this)">×</button>'
+                '</span>'
+            )
+
+        if favorite_links:
+            catalog_favorites_html = (
+                '<nav class="catalog-favorites">'
+                '<span class="catalog-favorites-label">'
+                '즐겨찾기'
+                '</span>'
+                + "".join(favorite_links)
+                + "</nav>"
+            )
+        else:
+            catalog_favorites_html = ""
+
+        language_filter_html = f"""
+        <form class="language-filter"
+              method="get"
+              action="{filter_base_path}">
+            <input type="hidden"
+                   name="view"
+                   value="{html.escape(view_mode)}">
+
+            <input type="hidden"
+                   name="reading"
+                   value="{html.escape(reading_filter)}">
+
+            <input type="hidden"
+                   name="q"
+                   value="{html.escape(search_query)}">
+
+            <label for="language-filter-select">
+                언어
+            </label>
+
+            <select id="language-filter-select"
+                    class="language-filter-select"
+                    name="language"
+                    onchange="this.form.submit()">
+                {"".join(language_options)}
+            </select>
+
+        </form>
+        """
+
+        pagination_html = ""
+
+        if view_mode == "page":
+            previous_page = max(
+                1,
+                current_page - 1,
+            )
+            next_page = min(
+                total_pages,
+                current_page + 1,
+            )
+
+            if current_page > 1:
+                previous_html = f"""
+                <a class="pager-button"
+                   href="{encoded_base_path}?view=page&page={previous_page}{search_suffix}">
+                    이전
+                </a>
+                """
+            else:
+                previous_html = """
+                <span class="pager-button disabled">
+                    이전
+                </span>
+                """
+
+            if current_page < total_pages:
+                next_html = f"""
+                <a class="pager-button"
+                   href="{encoded_base_path}?view=page&page={next_page}{search_suffix}">
+                    다음
+                </a>
+                """
+            else:
+                next_html = """
+                <span class="pager-button disabled">
+                    다음
+                </span>
+                """
+
+            first_html = f"""
+            <a class="pager-button"
+               href="{encoded_base_path}?view=page&page=1{search_suffix}">
+                처음
+            </a>
+            """
+
+            pagination_html = f"""
+            <nav class="pagination">
+                <div class="pager-row">
+                    {previous_html}
+
+                    <span class="page-status">
+                        {current_page} / {total_pages}
+                    </span>
+
+                    {next_html}
+                </div>
+
+                <form class="page-jump"
+                      method="get"
+                      action="{encoded_base_path}">
+                    <input type="hidden"
+                           name="view"
+                           value="page">
+
+                    <input type="hidden"
+                           name="q"
+                           value="{html.escape(search_query)}">
+
+                    <input type="hidden"
+                           name="reading"
+                           value="{html.escape(reading_filter)}">
+
+                    <input type="hidden"
+                           name="language"
+                           value="{html.escape(language_filter)}">
+
+                    <input type="hidden"
+                           name="author"
+                           value="{html.escape(author_filter, quote=True)}">
+
+                    <input type="hidden"
+                           name="series"
+                           value="{html.escape(series_filter, quote=True)}">
+
+                    <input type="hidden"
+                           name="sort"
+                           value="{html.escape(sort_mode, quote=True)}">
+
+                    {first_html}
+
+                    <input class="page-input"
+                           type="number"
+                           name="page"
+                           min="1"
+                           max="{total_pages}"
+                           value="{current_page}"
+                           inputmode="numeric"
+                           aria-label="이동할 페이지">
+
+                    <button class="pager-button"
+                            type="submit">
+                        이동
+                    </button>
+                </form>
+            </nav>
+            """
+
+        if not card_html:
+            card_html = (
+                '<div class="empty">이 폴더에 표시할 책이 없습니다.</div>'
+            )
+
+        body = f"""<!doctype html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1, viewport-fit=cover"
+    >
+
+    <title>내 서재</title>
+
+    <style>
+        * {{
+            box-sizing: border-box;
+        }}
+
+        html {{
+            background: #ece9e1;
+        }}
+
+        body {{
+            margin: 0;
+            color: #25231f;
+            background: #ece9e1;
+            font-family:
+                -apple-system,
+                BlinkMacSystemFont,
+                "Noto Sans KR",
+                Arial,
+                sans-serif;
+        }}
+
+        button,
+        input {{
+            font: inherit;
+        }}
+
+        .page {{
+            width: 100%;
+            max-width: 820px;
+            margin: 0 auto;
+            padding: 16px 12px 42px;
+        }}
+
+        .hero {{
+            margin-bottom: 14px;
+            padding: 20px;
+            background: #fffef9;
+            border: 1px solid #cfc9bb;
+            border-radius: 16px;
+        }}
+
+        .hero h1 {{
+            margin: 0 0 7px;
+            font-size: 25px;
+            line-height: 1.25;
+        }}
+
+        .hero-description {{
+            color: #666056;
+            font-size: 14px;
+            line-height: 1.6;
+        }}
+
+        .notice {{
+            margin-top: 13px;
+            padding: 11px 12px;
+            color: #474238;
+            background: #f1eee5;
+            border: 1px solid #ddd7ca;
+            border-radius: 10px;
+            font-size: 13px;
+            line-height: 1.55;
+        }}
+
+        .search-form {{
+            display: flex;
+            gap: 8px;
+            margin: 0 0 13px;
+        }}
+
+        .search-box {{
+            flex: 1;
+            min-width: 0;
+            width: 100%;
+            margin: 0;
+            padding: 13px 14px;
+            color: #222;
+            background: #fffef9;
+            border: 1px solid #c8c1b4;
+            border-radius: 12px;
+            outline: none;
+            font-size: 16px;
+        }}
+
+        .search-box:focus {{
+            border-color: #777064;
+        }}
+
+        .search-button {{
+            flex: 0 0 auto;
+            padding: 0 16px;
+            color: #28251f;
+            background: #ebe6db;
+            border: 1px solid #bdb5a7;
+            border-radius: 12px;
+            font-size: 15px;
+            font-weight: 700;
+        }}
+
+        .view-controls {{
+            margin: 0 0 13px;
+        }}
+
+        .view-button {{
+            display: block;
+            width: 100%;
+            padding: 11px 12px;
+            color: #37332d;
+            background: #fffef9;
+            border: 1px solid #aaa295;
+            border-radius: 10px;
+            text-align: center;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 700;
+        }}
+
+        .view-button:active {{
+            background: #e2ddd2;
+        }}
+
+        .pagination {{
+            display: flex;
+            flex-direction: column;
+            gap: 9px;
+            margin: 13px 0;
+            padding: 10px;
+            background: #fffef9;
+            border: 1px solid #d1cabc;
+            border-radius: 11px;
+        }}
+
+        .pager-row {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 7px;
+        }}
+
+        .page-jump {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 7px;
+        }}
+
+        .page-input {{
+            width: 72px;
+            padding: 9px 8px;
+            color: #28251f;
+            background: #fffef9;
+            border: 1px solid #bdb5a7;
+            border-radius: 9px;
+            text-align: center;
+            font-size: 15px;
+        }}
+
+        .pager-button {{
+            min-width: 68px;
+            padding: 9px 10px;
+            color: #292620;
+            background: #f1eee6;
+            border: 1px solid #999184;
+            border-radius: 8px;
+            text-align: center;
+            text-decoration: none;
+        }}
+
+        .pager-button.disabled {{
+            color: #aaa398;
+            background: #eeeae2;
+            border-color: #d3cdc1;
+        }}
+
+        .page-status {{
+            color: #555047;
+            font-size: 14px;
+            font-weight: 700;
+            white-space: nowrap;
+        }}
+
+        .book-card {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-height: 82px;
+            margin-bottom: 10px;
+            padding: 13px;
+            color: inherit;
+            background: #fffef9;
+            border: 1px solid #d1cabc;
+            border-radius: 14px;
+            text-decoration: none;
+        }}
+
+        .folder-card:active {{
+            background: #e4dfd4;
+        }}
+
+        .type-icon {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 57px;
+            min-width: 57px;
+            height: 44px;
+            padding: 4px;
+            color: #37332c;
+            border: 1px solid #918a7e;
+            border-radius: 9px;
+            font-size: 12px;
+            font-weight: 800;
+        }}
+
+        .book-info {{
+            flex: 1;
+            min-width: 0;
+        }}
+
+        .book-title {{
+            overflow-wrap: anywhere;
+            font-size: 16px;
+            font-weight: 750;
+            line-height: 1.42;
+        }}
+
+        .book-meta {{
+            margin-top: 5px;
+            color: #777065;
+            font-size: 12px;
+        }}
+
+        .book-details {{
+            flex: 1;
+            min-width: 0;
+        }}
+
+        .book-summary {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-width: 0;
+            cursor: pointer;
+            list-style: none;
+        }}
+
+        .book-summary::-webkit-details-marker {{
+            display: none;
+        }}
+
+        .book-summary::marker {{
+            display: none;
+            content: "";
+        }}
+
+        .book-extra {{
+            box-sizing: border-box;
+            width: calc(100% + 55px);
+            margin-top: 12px;
+            margin-left: 0;
+            margin-right: -55px;
+            padding: 10px;
+            background: #f4f1e9;
+            border: 1px solid #c8c1b5;
+            border-radius: 9px;
+            font-size: 12px;
+        }}
+
+        .catalog-filter-panel {{
+            margin: 10px 0;
+            padding: 10px;
+            background: #f4f1e9;
+            border: 1px solid #d4cec2;
+            border-radius: 12px;
+        }}
+
+        .catalog-filter-panel .catalog-filter {{
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            border: 0;
+            grid-template-columns:
+                repeat(2, minmax(0, 1fr));
+        }}
+
+        .catalog-tag-section {{
+            display: grid;
+            gap: 7px;
+            margin-top: 11px;
+            padding-top: 10px;
+            border-top: 1px solid #d4cec2;
+            color: #625c52;
+            font-size: 10px;
+        }}
+
+        .catalog-tag-list {{
+            display: flex;
+            gap: 6px;
+        }}
+
+        .catalog-tag-button,
+        .catalog-tag-clear {{
+            display: inline-flex;
+            align-items: center;
+            min-height: 28px;
+            padding: 5px 9px;
+            color: #625c52;
+            background: #fffdf7;
+            border: 1px solid #bdb5a8;
+            border-radius: 999px;
+            text-decoration: none;
+            font-size: 10px;
+            font-weight: 800;
+        }}
+
+        .catalog-tag-button.selected {{
+            color: #fffdf7;
+            background: #625c52;
+            border-color: #625c52;
+        }}
+
+        .catalog-tag-clear {{
+            color: #7c2929;
+            background: #f6dddd;
+            border-color: #b86f6f;
+        }}
+
+        .catalog-tag-empty {{
+            color: #8a8378;
+            font-size: 10px;
+        }}
+
+        .catalog-filter {{
+            display: grid;
+            grid-template-columns:
+                repeat(3, minmax(0, 1fr));
+            gap: 8px;
+            margin: 10px 0;
+            padding: 10px;
+            background: #f4f1e9;
+            border: 1px solid #d4cec2;
+            border-radius: 12px;
+        }}
+
+        .catalog-filter label {{
+            display: grid;
+            gap: 5px;
+            min-width: 0;
+            color: #625c52;
+            font-size: 10px;
+            font-weight: 800;
+        }}
+
+        .catalog-filter select {{
+            box-sizing: border-box;
+            width: 100%;
+            min-width: 0;
+            padding: 7px 8px;
+            color: #38342e;
+            background: #fffdf7;
+            border: 1px solid #bdb5a8;
+            border-radius: 8px;
+            font: inherit;
+            font-size: 11px;
+        }}
+
+        .catalog-favorites {{
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin: 10px 0;
+            padding: 8px;
+            overflow-x: auto;
+            white-space: nowrap;
+            background: #fff8d9;
+            border: 1px solid #d7c16d;
+            border-radius: 12px;
+        }}
+
+        .catalog-favorites-label {{
+            flex: 0 0 auto;
+            color: #675615;
+            font-size: 10px;
+            font-weight: 900;
+        }}
+
+        .catalog-favorite-link {{
+            flex: 0 0 auto;
+            padding: 6px 9px;
+            color: #584918;
+            background: #fffdf3;
+            border: 1px solid #d0b853;
+            border-radius: 999px;
+            text-decoration: none;
+            font-size: 10px;
+            font-weight: 800;
+        }}
+
+        .catalog-favorite-link.series {{
+            background: #f8edb5;
+        }}
+
+        @media (max-width: 600px) {{
+            .catalog-filter {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+
+        .catalog-value-row {{
+            grid-template-columns:
+                48px
+                minmax(0, 1fr)
+                auto;
+        }}
+
+        .catalog-value {{
+            min-width: 0;
+            overflow-wrap: anywhere;
+        }}
+
+        .catalog-favorite-button {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 29px;
+            height: 29px;
+            padding: 0;
+            color: #777066;
+            background: #f4f1e9;
+            border: 1px solid #bdb5a8;
+            border-radius: 50%;
+            font: inherit;
+            font-size: 17px;
+            line-height: 1;
+            cursor: pointer;
+        }}
+
+        .catalog-favorite-button.active {{
+            color: #745f19;
+            background: #f6e8a6;
+            border-color: #b99c3f;
+        }}
+
+        .catalog-favorite-button:disabled {{
+            opacity: 0.55;
+            cursor: wait;
+        }}
+
+        .metadata-editor-area {{
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #d4cec2;
+        }}
+
+        .metadata-edit-toggle {{
+            padding: 6px 9px;
+            color: #625c52;
+            background: #f4f1e9;
+            border: 1px solid #bdb5a8;
+            border-radius: 8px;
+            font: inherit;
+            font-size: 10px;
+            font-weight: 800;
+            cursor: pointer;
+        }}
+
+        .metadata-editor {{
+            margin-top: 10px;
+        }}
+
+        .metadata-editor label {{
+            display: grid;
+            grid-template-columns: 42px minmax(0, 1fr);
+            align-items: center;
+            gap: 8px;
+            margin-top: 7px;
+            color: #625c52;
+            font-size: 11px;
+            font-weight: 800;
+        }}
+
+        .metadata-input {{
+            box-sizing: border-box;
+            width: 100%;
+            min-width: 0;
+            padding: 7px 8px;
+            color: #38342e;
+            background: #fffdf7;
+            border: 1px solid #bdb5a8;
+            border-radius: 8px;
+            font: inherit;
+            font-size: 12px;
+        }}
+
+        .metadata-input:focus {{
+            outline: 2px solid #a9a092;
+            outline-offset: 1px;
+        }}
+
+        .metadata-tags-editor {{
+            display: grid;
+            grid-template-columns: 42px minmax(0, 1fr);
+            align-items: start;
+            gap: 8px;
+            margin-top: 7px;
+        }}
+
+        .metadata-tags-label {{
+            padding-top: 8px;
+            color: #625c52;
+            font-size: 11px;
+            font-weight: 800;
+        }}
+
+        .metadata-tag-chips {{
+            grid-column: 2;
+            display: flex;
+            gap: 6px;
+            min-height: 1px;
+        }}
+
+        .metadata-tag-chip {{
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            min-height: 27px;
+            padding: 4px 7px 4px 9px;
+            color: #554e44;
+            background: #eee9dd;
+            border: 1px solid #c7bfb1;
+            border-radius: 999px;
+            font: inherit;
+            font-size: 10px;
+            font-weight: 800;
+        }}
+
+        .metadata-tag-remove {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px;
+            height: 18px;
+            padding: 0;
+            color: #7c2929;
+            background: #f8e4e4;
+            border: 0;
+            border-radius: 50%;
+            font: inherit;
+            font-size: 12px;
+            line-height: 1;
+            cursor: pointer;
+        }}
+
+        .metadata-tag-picker {{
+            grid-column: 2;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+            gap: 6px;
+        }}
+
+        .metadata-existing-select {{
+            min-width: 0;
+        }}
+
+        @media (max-width: 560px) {{
+            .metadata-tag-picker {{
+                grid-template-columns: minmax(0, 1fr) auto;
+            }}
+
+            .metadata-tag-picker
+            .metadata-existing-select {{
+                grid-column: 1;
+            }}
+
+            .metadata-tag-picker
+            .metadata-tag-add-button {{
+                grid-column: 2;
+                grid-row: 1 / span 2;
+            }}
+        }}
+
+        .metadata-tag-add-button {{
+            padding: 6px 10px;
+            color: #fffdf7;
+            background: #625c52;
+            border: 1px solid #625c52;
+            border-radius: 8px;
+            font: inherit;
+            font-size: 10px;
+            font-weight: 800;
+            cursor: pointer;
+        }}
+
+        .metadata-editor-actions {{
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 7px;
+            margin-top: 10px;
+        }}
+
+        .metadata-result {{
+            margin-right: auto;
+            color: #55704f;
+            font-size: 10px;
+            font-weight: 700;
+        }}
+
+        .metadata-result.error {{
+            color: #8b3434;
+        }}
+
+        .metadata-save-button,
+        .metadata-reset-button {{
+            padding: 6px 9px;
+            border-radius: 8px;
+            font: inherit;
+            font-size: 10px;
+            font-weight: 800;
+            cursor: pointer;
+        }}
+
+        .metadata-save-button {{
+            color: #fffdf7;
+            background: #625c52;
+            border: 1px solid #625c52;
+        }}
+
+        .metadata-reset-button {{
+            color: #7c2929;
+            background: #f6dddd;
+            border: 1px solid #b86f6f;
+        }}
+
+        .book-note-area {{
+            margin-top: 11px;
+            padding-top: 10px;
+            border-top: 1px solid #d1cabf;
+        }}
+
+        .book-note-area label {{
+            display: block;
+            margin-bottom: 6px;
+            color: #5f584e;
+            font-size: 12px;
+            font-weight: 800;
+        }}
+
+        .book-note-input {{
+            display: block;
+            box-sizing: border-box;
+            width: 100%;
+            min-height: 76px;
+            padding: 9px 10px;
+            color: #403b34;
+            background: #fffdf8;
+            border: 1px solid #bdb5a8;
+            border-radius: 8px;
+            font: inherit;
+            font-size: 12px;
+            line-height: 1.45;
+            resize: vertical;
+        }}
+
+        .book-note-input:focus {{
+            outline: 2px solid #958c7e;
+            outline-offset: 1px;
+        }}
+
+        .book-note-input.saved {{
+            min-height: 0;
+            height: 32px;
+            padding-top: 6px;
+            padding-bottom: 6px;
+            overflow: hidden;
+            color: #4f493f;
+            background: #f4f1e9;
+            border-color: transparent;
+            cursor: default;
+            resize: none;
+        }}
+
+        .book-note-input.saved:focus {{
+            outline: none;
+        }}
+
+        .book-note-input.hidden {{
+            display: none;
+        }}
+
+        .book-note-actions {{
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 9px;
+            margin-top: 7px;
+        }}
+
+        .book-note-result {{
+            min-height: 15px;
+            color: #5d7552;
+            font-size: 10px;
+            font-weight: 700;
+        }}
+
+        .book-note-result.error {{
+            color: #9a3c3c;
+        }}
+
+        .book-note-save {{
+            padding: 6px 12px;
+            color: #fffdf7;
+            background: #625c52;
+            border: 1px solid #625c52;
+            border-radius: 8px;
+            font: inherit;
+            font-size: 11px;
+            font-weight: 800;
+            cursor: pointer;
+        }}
+
+        .book-note-save:disabled {{
+            opacity: 0.55;
+            cursor: default;
+        }}
+
+        .book-extra-row {{
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            margin: 5px 0;
+            line-height: 1.45;
+        }}
+
+        .book-extra-row strong {{
+            width: 48px;
+            min-width: 48px;
+            color: #5f584e;
+        }}
+
+        .status-select-row {{
+            align-items: center;
+        }}
+
+        .status-options {{
+            display: flex;
+            gap: 7px;
+        }}
+
+        .status-option {{
+            display: inline-block;
+            min-width: 45px;
+            padding: 5px 9px;
+            border: 1px solid;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 800;
+            text-align: center;
+            text-decoration: none;
+            white-space: nowrap;
+        }}
+
+        .unread-option {{
+            color: #7c2929;
+            background: #f6dddd;
+            border-color: #b86f6f;
+        }}
+
+        .finished-option {{
+            color: #234f79;
+            background: #dceaf7;
+            border-color: #7398ba;
+        }}
+
+        .status-option:active {{
+            opacity: 0.7;
+        }}
+
+        .card-actions {{
+            position: relative;
+            align-self: flex-start;
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            gap: 6px;
+            padding-bottom: 10px;
+            overflow: visible;
+        }}
+
+        .download-button,
+        .cancel-button,
+        .open-button {{
+            min-width: 54px;
+            padding: 9px 10px;
+            color: #24211d;
+            background: #f1eee6;
+            border: 1px solid #999184;
+            border-radius: 9px;
+            text-align: center;
+            white-space: nowrap;
+        }}
+
+        .download-button:active,
+        .cancel-button:active {{
+            background: #dcd6ca;
+        }}
+
+        .downloaded-badge {{
+            z-index: 4;
+        }}
+
+        .reading-status {{
+            position: absolute;
+            top: 31px;
+            left: -8px;
+            z-index: 3;
+            display: block;
+            box-sizing: border-box;
+            width: auto;
+            min-width: 34px;
+            padding: 3px 6px;
+            border: 1px solid;
+            border-radius: 999px;
+            font-size: 9px;
+            font-weight: 800;
+            line-height: 1.2;
+            text-align: center;
+            text-decoration: none;
+            white-space: nowrap;
+            pointer-events: none;
+        }}
+
+        .reading-status.unread {{
+            color: #7c2929;
+            background: #f6dddd;
+            border-color: #b86f6f;
+        }}
+
+        .reading-status.finished {{
+            color: #234f79;
+            background: #dceaf7;
+            border-color: #7398ba;
+        }}
+
+        .reading-status:active {{
+            opacity: 0.7;
+        }}
+
+        .cancel-button {{
+            min-width: 54px;
+            padding: 8px 10px;
+            color: #4d2828;
+            background: #f3e9e7;
+            border: 1px solid #a68b86;
+            border-radius: 9px;
+            text-align: center;
+            white-space: nowrap;
+        }}
+
+        .progress-area {{
+            margin-top: 11px;
+        }}
+
+        .progress-track {{
+            width: 100%;
+            height: 11px;
+            overflow: hidden;
+            background: #ddd8ce;
+            border: 1px solid #c1baad;
+            border-radius: 999px;
+        }}
+
+        .progress-bar {{
+            width: 0%;
+            height: 100%;
+            background: #4f6d58;
+            transition: width 0.25s linear;
+        }}
+
+        .progress-row {{
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            margin-top: 5px;
+            color: #686157;
+            font-size: 12px;
+            line-height: 1.4;
+        }}
+
+        .progress-row strong {{
+            color: #38342e;
+            white-space: nowrap;
+        }}
+
+        .hidden {{
+            display: none;
+        }}
+
+        .empty {{
+            padding: 34px 16px;
+            color: #777065;
+            background: #fffef9;
+            border: 1px solid #d1cabc;
+            border-radius: 14px;
+            text-align: center;
+        }}
+
+        .footer {{
+            margin-top: 18px;
+            color: #777065;
+            text-align: center;
+            font-size: 12px;
+            line-height: 1.6;
+        }}
+
+        #downloadFrame {{
+            display: none;
+            width: 0;
+            height: 0;
+            border: 0;
+        }}
+
+        @media (max-width: 480px) {{
+            .page {{
+                padding: 9px 7px 30px;
+            }}
+
+            .hero {{
+                padding: 15px;
+                border-radius: 10px;
+            }}
+
+            .book-card {{
+                gap: 9px;
+                padding: 11px 9px;
+                border-radius: 9px;
+            }}
+
+            .type-icon {{
+                width: 48px;
+                min-width: 48px;
+            }}
+
+            .download-button,
+            .open-button {{
+                min-width: 47px;
+                padding: 8px 7px;
+            }}
+        }}
+
+        .download-history {{
+            box-sizing: border-box;
+            width: 62px;
+            max-width: 62px;
+            margin-top: 6px;
+            color: #716a5f;
+            font-size: 10px;
+            line-height: 1.3;
+            text-align: center;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            word-break: keep-all;
+        }}
+
+
+        .book-card.downloaded {{
+            position: relative;
+            background: #eef3e9;
+            border-color: #9eae91;
+        }}
+
+        .book-card.downloaded .type-icon {{
+            background: #dfe8d7;
+            border-color: #a9b99d;
+        }}
+
+        .downloaded-badge {{
+            position: absolute;
+            top: 7px;
+            right: 8px;
+            padding: 3px 7px;
+            color: #495943;
+            background: #dce7d4;
+            border: 1px solid #a7b89a;
+            border-radius: 999px;
+            font-size: 10px;
+            font-weight: 700;
+            line-height: 1.2;
+        }}
+
+
+        .library-title {{
+            display: inline-block;
+            margin: 0;
+            padding: 0;
+            color: inherit;
+            background: transparent;
+            border: 0;
+            text-decoration: none;
+            font: inherit;
+            font-size: 30px;
+            font-weight: 800;
+            line-height: 1.2;
+            cursor: pointer;
+        }}
+
+        .library-title::after {{
+            content: "  ▾";
+            color: #777064;
+            font-size: 15px;
+            vertical-align: middle;
+        }}
+
+        .history-modal {{
+            position: fixed;
+            z-index: 9999;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 18px;
+            background: rgba(30, 28, 24, 0.58);
+        }}
+
+        .history-modal:target {{
+            display: flex;
+        }}
+
+        .history-backdrop {{
+            position: absolute;
+            inset: 0;
+        }}
+
+        .history-dialog {{
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 520px;
+            max-height: 82vh;
+            overflow: hidden;
+            background: #fffdf7;
+            border: 1px solid #aaa295;
+            border-radius: 15px;
+            box-shadow: 0 12px 35px rgba(0, 0, 0, 0.28);
+        }}
+
+        .history-header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 15px 16px;
+            border-bottom: 1px solid #d8d1c5;
+        }}
+
+        .history-header h2 {{
+            margin: 0;
+            color: #302c26;
+            font-size: 19px;
+        }}
+
+        .history-close {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 38px;
+            min-height: 38px;
+            padding: 0;
+            color: #49443d;
+            background: #eee9df;
+            border: 1px solid #c5bdaf;
+            border-radius: 10px;
+            font-size: 25px;
+            line-height: 1;
+            text-decoration: none;
+        }}
+
+        .history-list {{
+            max-height: calc(82vh - 70px);
+            overflow-y: auto;
+            padding: 12px;
+        }}
+
+        .history-item {{
+            margin-bottom: 9px;
+            padding: 12px 13px;
+            background: #f2f5ed;
+            border: 1px solid #bdc9b3;
+            border-radius: 11px;
+        }}
+
+        .history-item:last-child {{
+            margin-bottom: 0;
+        }}
+
+        .history-title {{
+            padding-right: 4px;
+            color: #292620;
+            font-size: 15px;
+            font-weight: 700;
+            line-height: 1.45;
+        }}
+
+        .history-author {{
+            margin-top: 4px;
+            color: #625d54;
+            font-size: 13px;
+            line-height: 1.4;
+        }}
+
+        .history-meta {{
+            margin-top: 6px;
+            color: #777064;
+            font-size: 12px;
+        }}
+
+        .history-empty {{
+            padding: 28px 15px;
+            color: #777064;
+            text-align: center;
+            font-size: 14px;
+        }}
+
+
+        .library-history {{
+            margin: 0;
+        }}
+
+        .library-title {{
+            display: inline-block;
+            margin: 0;
+            padding: 0;
+            color: inherit;
+            background: transparent;
+            border: 0;
+            font: inherit;
+            font-size: 30px;
+            font-weight: 800;
+            line-height: 1.2;
+            cursor: pointer;
+            list-style: none;
+        }}
+
+        .library-title::-webkit-details-marker {{
+            display: none;
+        }}
+
+        .library-title::after {{
+            content: "  ▾";
+            color: #777064;
+            font-size: 15px;
+            vertical-align: middle;
+        }}
+
+        .library-history[open] .library-title::after {{
+            content: "  ▴";
+        }}
+
+        .history-panel {{
+            margin-top: 14px;
+            overflow: hidden;
+            background: #fffdf7;
+            border: 1px solid #aaa295;
+            border-radius: 13px;
+            text-align: left;
+        }}
+
+        .history-panel-title {{
+            padding: 12px 14px;
+            color: #302c26;
+            background: #eee9df;
+            border-bottom: 1px solid #d8d1c5;
+            font-size: 16px;
+            font-weight: 700;
+        }}
+
+        .history-list {{
+            max-height: 55vh;
+            overflow-y: auto;
+            padding: 10px;
+        }}
+
+        .reading-filter {{
+            display: flex;
+            gap: 7px;
+            margin: 9px 0 14px;
+        }}
+
+        .reading-filter-button {{
+            appearance: none;
+            min-width: 48px;
+            padding: 6px 11px;
+            color: #625c52;
+            background: #f4f1e9;
+            border: 1px solid #bdb5a8;
+            border-radius: 999px;
+            font: inherit;
+            font-size: 11px;
+            font-weight: 800;
+            line-height: 1.2;
+            text-decoration: none;
+            cursor: pointer;
+        }}
+
+        .reading-filter-button.active {{
+            color: #fffdf7;
+            background: #625c52;
+            border-color: #625c52;
+        }}
+
+        .reading-filter-button:active {{
+            opacity: 0.72;
+        }}
+
+        .language-filter {{
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            margin: -5px 0 14px;
+        }}
+
+        .language-filter label {{
+            color: #625c52;
+            font-size: 11px;
+            font-weight: 800;
+        }}
+
+        .language-filter-select {{
+            box-sizing: border-box;
+            min-width: 105px;
+            padding: 6px 28px 6px 9px;
+            color: #514b42;
+            background: #f4f1e9;
+            border: 1px solid #bdb5a8;
+            border-radius: 8px;
+            font: inherit;
+            font-size: 11px;
+            font-weight: 700;
+        }}
+
+    
+        .catalog-favorite-item {{
+            display: inline-flex;
+            align-items: stretch;
+            vertical-align: middle;
+        }}
+
+        .catalog-favorite-item .catalog-favorite-link {{
+            border-top-right-radius: 0;
+            border-bottom-right-radius: 0;
+        }}
+
+        .catalog-favorite-remove {{
+            min-width: 30px;
+            padding: 0 8px;
+            border: 1px solid currentColor;
+            border-left: 0;
+            border-radius: 0 8px 8px 0;
+            background: transparent;
+            color: inherit;
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+        }}
+
+        .catalog-favorite-remove:hover {{
+            background: rgba(127, 127, 127, 0.18);
+        }}
+
+        .catalog-favorite-remove:disabled {{
+            cursor: wait;
+            opacity: 0.55;
+        }}
+
+
+        .catalog-favorite-item {{
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            vertical-align: middle;
+        }}
+
+        .catalog-favorite-item .catalog-favorite-link {{
+            border-radius: 999px;
+        }}
+
+        .catalog-favorite-remove {{
+            box-sizing: border-box;
+            width: 28px;
+            min-width: 28px;
+            height: 28px;
+            padding: 0;
+            border: 1px solid currentColor;
+            border-radius: 50%;
+            background: transparent;
+            color: inherit;
+            font: inherit;
+            font-size: 16px;
+            font-weight: 700;
+            line-height: 26px;
+            text-align: center;
+            cursor: pointer;
+        }}
+
+        .catalog-favorite-remove.round-fix {{
+            display: inline-block;
+        }}
+
+        .catalog-tag-item {{
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }}
+
+        .catalog-tag-favorite-button {{
+            box-sizing: border-box;
+            width: 28px;
+            min-width: 28px;
+            height: 28px;
+            padding: 0;
+            border: 1px solid currentColor;
+            border-radius: 50%;
+            background: transparent;
+            color: inherit;
+            font: inherit;
+            line-height: 26px;
+            cursor: pointer;
+        }}
+
+        .catalog-tag-favorite-button.active {{
+            font-weight: 700;
+        }}
+
+        .catalog-tag-favorite-button:disabled {{
+            cursor: wait;
+            opacity: 0.55;
+        }}
+
+
+        .catalog-favorite-remove {{
+            display: none;
+        }}
+
+        .catalog-favorite-remove.long-press-hidden {{
+            display: none;
+        }}
+
+        .catalog-favorite-item {{
+            position: relative;
+            touch-action: manipulation;
+            user-select: none;
+            -webkit-user-select: none;
+        }}
+
+        .catalog-favorite-item.long-press-ready
+        .catalog-favorite-link {{
+            transform: scale(0.97);
+            opacity: 0.78;
+        }}
+
+        .catalog-favorite-link {{
+            transition:
+                transform 0.12s ease,
+                opacity 0.12s ease;
+        }}
+
+
+        .catalog-favorite-remove,
+        .catalog-favorite-remove.mobile-visible {{
+            display: inline-flex !important;
+            align-items: center;
+            justify-content: center;
+            box-sizing: border-box;
+            width: 28px;
+            min-width: 28px;
+            height: 28px;
+            padding: 0;
+            border: 1px solid currentColor;
+            border-radius: 50%;
+            background: transparent;
+            color: inherit;
+            font: inherit;
+            font-size: 16px;
+            font-weight: 700;
+            line-height: 1;
+            cursor: pointer;
+            touch-action: manipulation;
+            user-select: none;
+            -webkit-user-select: none;
+        }}
+
+        .catalog-favorite-remove:disabled {{
+            cursor: wait;
+            opacity: 0.55;
+        }}
+
+
+        .catalog-favorite-item {{
+            display: inline-flex;
+            align-items: center;
+            gap: 2px;
+            padding-right: 2px;
+            border-radius: 999px;
+        }}
+
+        .catalog-favorite-remove,
+        .catalog-favorite-remove.polished {{
+            display: inline-flex !important;
+            align-items: center;
+            justify-content: center;
+            box-sizing: border-box;
+            width: 28px;
+            min-width: 28px;
+            height: 28px;
+            margin-left: -4px;
+            padding: 0;
+            border: 0;
+            border-radius: 999px;
+            background: transparent;
+            color: currentColor;
+            opacity: 0.48;
+            font: inherit;
+            font-size: 14px;
+            font-weight: 700;
+            line-height: 1;
+            cursor: pointer;
+            touch-action: manipulation;
+            user-select: none;
+            -webkit-user-select: none;
+            transition:
+                opacity 0.15s ease,
+                background 0.15s ease,
+                transform 0.12s ease;
+        }}
+
+        .catalog-favorite-remove:hover,
+        .catalog-favorite-remove:focus-visible {{
+            opacity: 0.9;
+            background: rgba(127, 127, 127, 0.14);
+            outline: none;
+        }}
+
+        .catalog-favorite-remove:active {{
+            opacity: 1;
+            background: rgba(127, 127, 127, 0.22);
+            transform: scale(0.92);
+        }}
+
+        .catalog-favorite-remove:disabled {{
+            cursor: wait;
+            opacity: 0.28;
+        }}
+
+        .catalog-favorite-link {{
+            border-radius: 999px;
+        }}
+
+
+        .catalog-favorite-item {{
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            overflow: visible;
+            margin-top: 4px;
+            margin-right: 4px;
+        }}
+
+        .catalog-favorite-remove,
+        .catalog-favorite-remove.corner-badge {{
+            display: inline-flex !important;
+            position: absolute;
+            top: -6px;
+            right: -6px;
+            z-index: 2;
+            align-items: center;
+            justify-content: center;
+            box-sizing: border-box;
+            width: 18px;
+            min-width: 18px;
+            height: 18px;
+            margin: 0;
+            padding: 0;
+            border: 1px solid rgba(127, 127, 127, 0.35);
+            border-radius: 999px;
+            background: var(--page-background, #fff);
+            color: currentColor;
+            opacity: 0.72;
+            font: inherit;
+            font-size: 12px;
+            font-weight: 800;
+            line-height: 1;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16);
+            cursor: pointer;
+            touch-action: manipulation;
+            user-select: none;
+            -webkit-user-select: none;
+            transition:
+                opacity 0.15s ease,
+                transform 0.12s ease,
+                box-shadow 0.15s ease;
+        }}
+
+        .catalog-favorite-remove:hover,
+        .catalog-favorite-remove:focus-visible {{
+            opacity: 1;
+            transform: scale(1.08);
+            outline: none;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.22);
+        }}
+
+        .catalog-favorite-remove:active {{
+            transform: scale(0.9);
+        }}
+
+        .catalog-favorite-remove:disabled {{
+            cursor: wait;
+            opacity: 0.35;
+        }}
+
+
+        .catalog-favorites,
+        .catalog-favorites.wrap-enabled {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            row-gap: 10px;
+            overflow: visible;
+        }}
+
+        .catalog-favorites-label {{
+            flex: 0 0 auto;
+        }}
+
+        .catalog-favorite-item {{
+            flex: 0 0 auto;
+            max-width: 100%;
+        }}
+
+        .catalog-favorite-link {{
+            display: inline-block;
+            max-width: min(72vw, 420px);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }}
+
+</style>
+</head>
+
+<body>
+    <main class="page">
+        <section class="hero">
+            <details class="library-history">
+                <summary class="library-title">
+                    내 도서관
+                </summary>
+
+                {build_download_history_modal(self.client_address[0])}
+            </details>
+
+            <div class="hero-description">
+                책을 누르면 폰 서버에서 리더기로 전송합니다.
+            </div>
+
+            <div class="notice">
+                전송률 100%는 서버 전송 완료를 뜻합니다.<br>
+                Moon+Reader에서 다운을 완료하면  <strong>.epub.mr</strong> 파일이
+                <strong>.epub</strong>으로 변합니다.
+            </div>
+        </section>
+
+        <form class="search-form"
+              method="get"
+              action="{encoded_base_path}">
+            <input type="hidden"
+                   name="view"
+                   value="{view_mode}">
+
+            <input type="hidden"
+                   name="reading"
+                   value="{html.escape(reading_filter)}">
+
+            <input type="hidden"
+                   name="language"
+                   value="{html.escape(language_filter)}">
+
+            <input
+                id="search"
+                class="search-box"
+                type="search"
+                name="q"
+                value="{html.escape(search_query)}"
+                placeholder="제목·저자·시리즈·태그 검색"
+                autocomplete="off"
+            >
+
+            <button class="search-button"
+                    type="submit">
+                검색
+            </button>
+        </form>
+
+        {reading_filter_html}
+        {language_filter_html}
+
+        {catalog_favorites_html}
+        {catalog_filter_html}
+
+        {view_controls}
+
+        {pagination_html}
+
+        <section id="bookList">
+            {card_html}
+        </section>
+
+        {pagination_html}
+
+        <div class="footer">
+            표시된 항목: {visible_count}개
+            / 전체 {total_items}개<br>
+            Pocket Library · Termux
+        </div>
+
+        <iframe
+            id="downloadFrame"
+            name="downloadFrame"
+            title="download"
+        ></iframe>
+    </main>
+
+    <script>
+        function applyBookFilters() {{
+            var search = document.getElementById("search");
+            var cards = document.querySelectorAll(".searchable");
+            var query = search ? search.value.toLowerCase() : "";
+
+            for (var i = 0; i < cards.length; i++) {{
+                var name =
+                    cards[i].getAttribute("data-name") || "";
+
+                cards[i].style.display =
+                    name.indexOf(query) !== -1
+                    ? "flex"
+                    : "none";
+            }}
+        }}
+
+        (function () {{
+            var search = document.getElementById("search");
+
+            if (search) {{
+                search.addEventListener(
+                    "input",
+                    applyBookFilters
+                );
+            }}
+
+            applyBookFilters();
+            initializeMetadataTagEditors();
+            synchronizeCatalogSeriesFavorites();
+            restoreCatalogScroll();
+        }})();
+
+        var activeDownloads = {{}};
+
+        function makeToken() {{
+            return (
+                Date.now().toString(36)
+                + "-"
+                + Math.random().toString(36).slice(2, 12)
+            );
+        }}
+
+        function reloadCatalogPreservingScroll() {{
+            try {{
+                sessionStorage.setItem(
+                    "catalog-scroll-y",
+                    String(window.scrollY || 0)
+                );
+            }} catch (error) {{
+                // 저장 실패 시 그냥 새로고침
+            }}
+
+            window.location.reload();
+        }}
+
+
+        function restoreCatalogScroll() {{
+            var savedScroll = null;
+
+            try {{
+                savedScroll = sessionStorage.getItem(
+                    "catalog-scroll-y"
+                );
+
+                sessionStorage.removeItem(
+                    "catalog-scroll-y"
+                );
+            }} catch (error) {{
+                return;
+            }}
+
+            if (savedScroll === null) {{
+                return;
+            }}
+
+            var scrollY = Number(savedScroll);
+
+            if (!Number.isFinite(scrollY)) {{
+                return;
+            }}
+
+            window.setTimeout(function() {{
+                window.scrollTo(0, scrollY);
+            }}, 50);
+        }}
+
+
+        function confirmAndDeleteCatalogFavorite(
+            button
+        ) {{
+            if (!button || button.disabled) {{
+                return;
+            }}
+
+            var item = button.closest(
+                ".catalog-favorite-item"
+            );
+
+            if (!item) {{
+                window.alert(
+                    "즐겨찾기 항목을 찾지 못했습니다."
+                );
+                return;
+            }}
+
+            var link = item.querySelector(
+                ".catalog-favorite-link"
+            );
+
+            var label = (
+                link
+                ? link.textContent
+                : "이 항목"
+            ).trim();
+
+            if (!window.confirm(
+                label
+                + "\\n\\n즐겨찾기에서 삭제할까요?"
+            )) {{
+                return;
+            }}
+
+            button.disabled = true;
+            deleteCatalogFavoriteDirect(item);
+        }}
+
+
+        function deleteCatalogFavoriteDirect(
+            item
+        ) {{
+            if (!item) {{
+                return;
+            }}
+
+            var favoriteType = "";
+            var encodedAuthor = "";
+            var encodedSeries = "";
+            var encodedTag = "";
+
+            if (item.classList.contains("series")) {{
+                favoriteType = "series";
+
+                encodedAuthor = (
+                    item.getAttribute(
+                        "data-favorite-author"
+                    ) || ""
+                );
+
+                encodedSeries = (
+                    item.getAttribute(
+                        "data-favorite-series"
+                    ) || ""
+                );
+            }} else if (item.classList.contains("tag")) {{
+                favoriteType = "tag";
+
+                encodedTag = (
+                    item.getAttribute(
+                        "data-favorite-tag"
+                    ) || ""
+                );
+            }} else {{
+                window.alert(
+                    "이 즐겨찾기는 길게 눌러 삭제할 수 없습니다."
+                );
+                return;
+            }}
+
+            var request = new XMLHttpRequest();
+
+            request.open(
+                "POST",
+                "/catalog-favorite",
+                true
+            );
+
+            request.setRequestHeader(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8"
+            );
+
+            request.onreadystatechange = function() {{
+                if (request.readyState !== 4) {{
+                    return;
+                }}
+
+                if (
+                    request.status < 200
+                    || request.status >= 300
+                ) {{
+                    window.alert(
+                        "즐겨찾기를 삭제하지 못했습니다."
+                    );
+                    return;
+                }}
+
+                try {{
+                    var response = JSON.parse(
+                        request.responseText
+                    );
+
+                    if (
+                        response.status !== "ok"
+                        || response.favorite
+                    ) {{
+                        window.alert(
+                            "즐겨찾기가 삭제되지 않았습니다."
+                        );
+                        return;
+                    }}
+
+                    reloadCatalogPreservingScroll();
+                }} catch (error) {{
+                    window.alert(
+                        "즐겨찾기 응답을 읽지 못했습니다."
+                    );
+                }}
+            }};
+
+            request.send(
+                "type="
+                + encodeURIComponent(favoriteType)
+                + "&author="
+                + encodedAuthor
+                + "&series="
+                + encodedSeries
+                + "&tag="
+                + encodedTag
+                + "&action=remove"
+            );
+        }}
+
+
+        function initializeCatalogFavoriteLongPress() {{
+            var favoriteItems = document.querySelectorAll(
+                ".catalog-favorite-item"
+            );
+
+            for (
+                var index = 0;
+                index < favoriteItems.length;
+                index++
+            ) {{
+                (function(item) {{
+                    var timer = null;
+                    var longPressed = false;
+                    var startX = 0;
+                    var startY = 0;
+
+                    var link = item.querySelector(
+                        ".catalog-favorite-link"
+                    );
+
+                    if (!link) {{
+                        return;
+                    }}
+
+                    function cancelTimer() {{
+                        if (timer !== null) {{
+                            window.clearTimeout(timer);
+                            timer = null;
+                        }}
+
+                        item.classList.remove(
+                            "long-press-ready"
+                        );
+                    }}
+
+                    function beginPress(event) {{
+                        if (
+                            event.button !== undefined
+                            && event.button !== 0
+                        ) {{
+                            return;
+                        }}
+
+                        longPressed = false;
+
+                        startX = Number(
+                            event.clientX || 0
+                        );
+
+                        startY = Number(
+                            event.clientY || 0
+                        );
+
+                        item.classList.add(
+                            "long-press-ready"
+                        );
+
+                        timer = window.setTimeout(
+                            function() {{
+                                timer = null;
+                                longPressed = true;
+
+                                item.classList.remove(
+                                    "long-press-ready"
+                                );
+
+                                var label = (
+                                    link.textContent || ""
+                                )
+                                    .replace(/^★\\s*/, "")
+                                    .trim();
+
+                                if (
+                                    window.confirm(
+                                        "즐겨찾기에서 삭제할까요?\\n\\n"
+                                        + label
+                                    )
+                                ) {{
+                                    deleteCatalogFavoriteDirect(
+                                        item
+                                    );
+                                }}
+                            }},
+                            700
+                        );
+                    }}
+
+                    function movePress(event) {{
+                        if (timer === null) {{
+                            return;
+                        }}
+
+                        var currentX = Number(
+                            event.clientX || startX
+                        );
+
+                        var currentY = Number(
+                            event.clientY || startY
+                        );
+
+                        if (
+                            Math.abs(
+                                currentX - startX
+                            ) > 12
+                            || Math.abs(
+                                currentY - startY
+                            ) > 12
+                        ) {{
+                            cancelTimer();
+                        }}
+                    }}
+
+                    item.addEventListener(
+                        "pointerdown",
+                        beginPress
+                    );
+
+                    item.addEventListener(
+                        "pointermove",
+                        movePress
+                    );
+
+                    item.addEventListener(
+                        "pointerup",
+                        cancelTimer
+                    );
+
+                    item.addEventListener(
+                        "pointercancel",
+                        cancelTimer
+                    );
+
+                    link.addEventListener(
+                        "click",
+                        function(event) {{
+                            if (!longPressed) {{
+                                return;
+                            }}
+
+                            event.preventDefault();
+                            event.stopPropagation();
+                            longPressed = false;
+                        }}
+                    );
+
+                    item.addEventListener(
+                        "contextmenu",
+                        function(event) {{
+                            event.preventDefault();
+                        }}
+                    );
+                }})(favoriteItems[index]);
+            }}
+        }}
+
+
+        function setCatalogTagFavoriteState(
+            encodedTag,
+            favorite
+        ) {{
+            var buttons = document.querySelectorAll(
+                '[data-favorite-tag]'
+            );
+
+            for (
+                var index = 0;
+                index < buttons.length;
+                index++
+            ) {{
+                var current = buttons[index];
+
+                if (
+                    current.getAttribute(
+                        "data-favorite-tag"
+                    ) !== encodedTag
+                ) {{
+                    continue;
+                }}
+
+                if (
+                    current.classList.contains(
+                        "catalog-tag-favorite-button"
+                    )
+                ) {{
+                    current.textContent = (
+                        favorite ? "★" : "☆"
+                    );
+
+                    current.classList.toggle(
+                        "active",
+                        favorite
+                    );
+                }}
+            }}
+        }}
+
+
+        function sendCatalogTagFavoriteRequest(
+            encodedTag,
+            callback
+        ) {{
+            var request = new XMLHttpRequest();
+
+            request.open(
+                "POST",
+                "/catalog-favorite",
+                true
+            );
+
+            request.setRequestHeader(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8"
+            );
+
+            request.onreadystatechange = function() {{
+                if (request.readyState !== 4) {{
+                    return;
+                }}
+
+                if (
+                    request.status < 200
+                    || request.status >= 300
+                ) {{
+                    callback(
+                        new Error("request failed")
+                    );
+
+                    return;
+                }}
+
+                try {{
+                    callback(
+                        null,
+                        JSON.parse(request.responseText)
+                    );
+                }} catch (error) {{
+                    callback(error);
+                }}
+            }};
+
+            request.send(
+                "type=tag"
+                + "&author="
+                + "&series="
+                + "&tag="
+                + encodedTag
+            );
+        }}
+
+
+        function toggleCatalogTagFavorite(button) {{
+            if (!button || button.disabled) {{
+                return;
+            }}
+
+            var encodedTag = button.getAttribute(
+                "data-favorite-tag"
+            );
+
+            if (!encodedTag) {{
+                window.alert(
+                    "태그 값을 찾지 못했습니다."
+                );
+                return;
+            }}
+
+            button.disabled = true;
+
+            sendCatalogTagFavoriteRequest(
+                encodedTag,
+                function(error, response) {{
+                    button.disabled = false;
+
+                    if (
+                        error
+                        || !response
+                        || response.status !== "ok"
+                    ) {{
+                        window.alert(
+                            "태그 즐겨찾기를 저장하지 못했습니다."
+                        );
+                        return;
+                    }}
+
+                    setCatalogTagFavoriteState(
+                        encodedTag,
+                        Boolean(response.favorite)
+                    );
+
+                    window.setTimeout(
+                        reloadCatalogPreservingScroll,
+                        80
+                    );
+                }}
+            );
+        }}
+
+
+        function removeCatalogTagFavorite(
+            button,
+            encodedTag
+        ) {{
+            if (!button || button.disabled) {{
+                return;
+            }}
+
+            button.disabled = true;
+
+            sendCatalogTagFavoriteRequest(
+                encodedTag,
+                function(error, response) {{
+                    if (
+                        error
+                        || !response
+                        || response.favorite
+                    ) {{
+                        button.disabled = false;
+
+                        window.alert(
+                            "태그 즐겨찾기를 삭제하지 못했습니다."
+                        );
+
+                        return;
+                    }}
+
+                    setCatalogTagFavoriteState(
+                        encodedTag,
+                        false
+                    );
+
+                    var item = button.closest(
+                        ".catalog-favorite-item"
+                    );
+
+                    if (item) {{
+                        item.remove();
+                    }}
+
+                    var favorites = document.querySelector(
+                        ".catalog-favorites"
+                    );
+
+                    if (
+                        favorites
+                        && !favorites.querySelector(
+                            ".catalog-favorite-link"
+                        )
+                    ) {{
+                        favorites.remove();
+                    }}
+                }}
+            );
+        }}
+
+
+        function setCatalogSeriesFavoriteState(
+            encodedSeries,
+            favorite
+        ) {{
+            var buttons = document.querySelectorAll(
+                '[data-favorite-type="series"]'
+            );
+
+            for (
+                var index = 0;
+                index < buttons.length;
+                index++
+            ) {{
+                var currentButton = buttons[index];
+
+                if (
+                    currentButton.getAttribute(
+                        "data-favorite-series"
+                    ) !== encodedSeries
+                ) {{
+                    continue;
+                }}
+
+                currentButton.textContent = (
+                    favorite ? "★" : "☆"
+                );
+
+                currentButton.className = (
+                    favorite
+                    ? "catalog-favorite-button active"
+                    : "catalog-favorite-button"
+                );
+            }}
+        }}
+
+
+        function synchronizeCatalogSeriesFavorites() {{
+            var buttons = document.querySelectorAll(
+                '[data-favorite-type="series"]'
+            );
+
+            var activeSeries = {{}};
+
+            for (
+                var index = 0;
+                index < buttons.length;
+                index++
+            ) {{
+                var button = buttons[index];
+
+                if (
+                    button.classList.contains("active")
+                ) {{
+                    activeSeries[
+                        button.getAttribute(
+                            "data-favorite-series"
+                        )
+                    ] = true;
+                }}
+            }}
+
+            for (var encodedSeries in activeSeries) {{
+                if (
+                    Object.prototype.hasOwnProperty.call(
+                        activeSeries,
+                        encodedSeries
+                    )
+                ) {{
+                    setCatalogSeriesFavoriteState(
+                        encodedSeries,
+                        true
+                    );
+                }}
+            }}
+        }}
+
+
+        function removeCatalogSeriesFavorite(
+            button,
+            encodedAuthor,
+            encodedSeries
+        ) {{
+            if (!button || button.disabled) {{
+                return;
+            }}
+
+            button.disabled = true;
+
+            var request = new XMLHttpRequest();
+
+            request.open(
+                "POST",
+                "/catalog-favorite",
+                true
+            );
+
+            request.setRequestHeader(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8"
+            );
+
+            request.onreadystatechange = function() {{
+                if (request.readyState !== 4) {{
+                    return;
+                }}
+
+                if (
+                    request.status < 200
+                    || request.status >= 300
+                ) {{
+                    button.disabled = false;
+
+                    window.alert(
+                        "즐겨찾기를 삭제하지 못했습니다."
+                    );
+
+                    return;
+                }}
+
+                try {{
+                    var response = JSON.parse(
+                        request.responseText
+                    );
+
+                    if (response.favorite) {{
+                        button.disabled = false;
+
+                        window.alert(
+                            "즐겨찾기가 삭제되지 않았습니다."
+                        );
+
+                        return;
+                    }}
+
+                    setCatalogSeriesFavoriteState(
+                        encodedSeries,
+                        false
+                    );
+
+                    var item = button.closest(
+                        ".catalog-favorite-item"
+                    );
+
+                    if (item) {{
+                        item.remove();
+                    }}
+
+                    var favorites = document.querySelector(
+                        ".catalog-favorites"
+                    );
+
+                    if (
+                        favorites
+                        && !favorites.querySelector(
+                            ".catalog-favorite-link"
+                        )
+                    ) {{
+                        favorites.remove();
+                    }}
+                }} catch (error) {{
+                    button.disabled = false;
+
+                    window.alert(
+                        "즐겨찾기 응답을 읽지 못했습니다."
+                    );
+                }}
+            }};
+
+            request.send(
+                "type=series"
+                + "&author="
+                + encodedAuthor
+                + "&series="
+                + encodedSeries
+            );
+        }}
+
+
+        function toggleCatalogFavorite(
+            cardId,
+            favoriteType,
+            encodedAuthor,
+            encodedSeries,
+            button
+        ) {{
+            if (!button || button.disabled) {{
+                return;
+            }}
+
+            button.disabled = true;
+
+            var request = new XMLHttpRequest();
+
+            request.open(
+                "POST",
+                "/catalog-favorite",
+                true
+            );
+
+            request.setRequestHeader(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8"
+            );
+
+            request.onreadystatechange = function() {{
+                if (request.readyState !== 4) {{
+                    return;
+                }}
+
+                button.disabled = false;
+
+                if (
+                    request.status < 200
+                    || request.status >= 300
+                ) {{
+                    window.alert(
+                        "즐겨찾기를 저장하지 못했습니다."
+                    );
+                    return;
+                }}
+
+                try {{
+                    var response = JSON.parse(
+                        request.responseText
+                    );
+
+                    if (favoriteType === "series") {{
+                        setCatalogSeriesFavoriteState(
+                            encodedSeries,
+                            response.favorite
+                        );
+                    }} else if (response.favorite) {{
+                        button.textContent = "★";
+                        button.className = (
+                            "catalog-favorite-button active"
+                        );
+                    }} else {{
+                        button.textContent = "☆";
+                        button.className = (
+                            "catalog-favorite-button"
+                        );
+                    if (response.favorite) {{
+                        window.setTimeout(
+                            reloadCatalogPreservingScroll,
+                            80
+                        );
+                    }}
+
+                    }}
+
+                }} catch (error) {{
+                    window.alert(
+                        "즐겨찾기 응답을 읽지 못했습니다."
+                    );
+                }}
+            }};
+
+            request.send(
+                "type="
+                + encodeURIComponent(favoriteType)
+                + "&author="
+                + encodedAuthor
+                + "&series="
+                + encodedSeries
+            );
+        }}
+
+
+        function parseMetadataTags(value) {{
+            var rawItems = String(
+                value || ""
+            )
+                .replace(/\\n/g, ",")
+                .split(",");
+
+            var tags = [];
+            var seen = {{}};
+
+            for (
+                var index = 0;
+                index < rawItems.length;
+                index++
+            ) {{
+                var tag = rawItems[index]
+                    .replace(/\\s+/g, " ")
+                    .trim();
+
+                if (!tag) {{
+                    continue;
+                }}
+
+                var key = tag.toLocaleLowerCase();
+
+                if (seen[key]) {{
+                    continue;
+                }}
+
+                seen[key] = true;
+                tags.push(tag);
+            }}
+
+            return tags;
+        }}
+
+
+        function setMetadataTags(cardId, tags) {{
+            var hiddenInput = document.getElementById(
+                cardId + "-metadata-tags"
+            );
+
+            if (!hiddenInput) {{
+                return;
+            }}
+
+            hiddenInput.value = tags.join(", ");
+            renderMetadataTagChips(cardId);
+        }}
+
+
+        function renderMetadataTagChips(cardId) {{
+            var hiddenInput = document.getElementById(
+                cardId + "-metadata-tags"
+            );
+
+            var chipContainer = document.getElementById(
+                cardId + "-metadata-tag-chips"
+            );
+
+            if (!hiddenInput || !chipContainer) {{
+                return;
+            }}
+
+            var tags = parseMetadataTags(
+                hiddenInput.value
+            );
+
+            chipContainer.textContent = "";
+
+            for (
+                var index = 0;
+                index < tags.length;
+                index++
+            ) {{
+                var tag = tags[index];
+
+                var chip = document.createElement(
+                    "span"
+                );
+
+                chip.className = "metadata-tag-chip";
+
+                var label = document.createElement(
+                    "span"
+                );
+
+                label.textContent = tag;
+
+                var removeButton = document.createElement(
+                    "button"
+                );
+
+                removeButton.type = "button";
+                removeButton.className = (
+                    "metadata-tag-remove"
+                );
+                removeButton.textContent = "×";
+                removeButton.title = "태그 제거";
+                removeButton.setAttribute(
+                    "data-tag",
+                    tag
+                );
+
+                removeButton.onclick = function() {{
+                    removeMetadataTag(
+                        cardId,
+                        this.getAttribute("data-tag")
+                    );
+                }};
+
+                chip.appendChild(label);
+                chip.appendChild(removeButton);
+                chipContainer.appendChild(chip);
+            }}
+        }}
+
+
+        function addTagToMetadataSelects(tagValue) {{
+            var tag = String(
+                tagValue || ""
+            )
+                .replace(/\\s+/g, " ")
+                .trim();
+
+            if (!tag) {{
+                return;
+            }}
+
+            var tagKey = tag.toLocaleLowerCase();
+
+            var selects = document.querySelectorAll(
+                'select[id$="-metadata-tag-select"]'
+            );
+
+            for (
+                var selectIndex = 0;
+                selectIndex < selects.length;
+                selectIndex++
+            ) {{
+                var select = selects[selectIndex];
+                var exists = false;
+
+                for (
+                    var optionIndex = 0;
+                    optionIndex < select.options.length;
+                    optionIndex++
+                ) {{
+                    var optionValue = String(
+                        select.options[optionIndex].value || ""
+                    );
+
+                    if (
+                        optionValue.toLocaleLowerCase()
+                        === tagKey
+                    ) {{
+                        exists = true;
+                        break;
+                    }}
+                }}
+
+                if (exists) {{
+                    continue;
+                }}
+
+                var option = document.createElement(
+                    "option"
+                );
+
+                option.value = tag;
+                option.textContent = tag;
+                select.appendChild(option);
+            }}
+        }}
+
+
+        function commitPendingMetadataTags(cardId) {{
+            var hiddenInput = document.getElementById(
+                cardId + "-metadata-tags"
+            );
+
+            var addInput = document.getElementById(
+                cardId + "-metadata-tag-add"
+            );
+
+            var tagSelect = document.getElementById(
+                cardId + "-metadata-tag-select"
+            );
+
+            if (!hiddenInput) {{
+                return [];
+            }}
+
+            var tags = parseMetadataTags(
+                hiddenInput.value
+            );
+
+            var incomingValues = [];
+
+            if (addInput && addInput.value) {{
+                incomingValues = incomingValues.concat(
+                    parseMetadataTags(addInput.value)
+                );
+            }}
+
+            if (tagSelect && tagSelect.value) {{
+                incomingValues = incomingValues.concat(
+                    parseMetadataTags(tagSelect.value)
+                );
+            }}
+
+            var seen = {{}};
+
+            for (
+                var index = 0;
+                index < tags.length;
+                index++
+            ) {{
+                seen[
+                    tags[index].toLocaleLowerCase()
+                ] = true;
+            }}
+
+            for (
+                var incomingIndex = 0;
+                incomingIndex < incomingValues.length;
+                incomingIndex++
+            ) {{
+                var incomingTag = incomingValues[
+                    incomingIndex
+                ];
+
+                var incomingKey = incomingTag
+                    .toLocaleLowerCase();
+
+                if (seen[incomingKey]) {{
+                    continue;
+                }}
+
+                seen[incomingKey] = true;
+                tags.push(incomingTag);
+
+                if (
+                    typeof addTagToMetadataSelects
+                    === "function"
+                ) {{
+                    addTagToMetadataSelects(
+                        incomingTag
+                    );
+                }}
+            }}
+
+            hiddenInput.value = tags.join(", ");
+
+            if (addInput) {{
+                addInput.value = "";
+            }}
+
+            if (tagSelect) {{
+                tagSelect.value = "";
+            }}
+
+            return tags;
+        }}
+
+
+        function addMetadataTag(cardId) {{
+            var tags = commitPendingMetadataTags(
+                cardId
+            );
+
+            if (!tags.length) {{
+                var addInput = document.getElementById(
+                    cardId + "-metadata-tag-add"
+                );
+
+                if (addInput) {{
+                    addInput.focus();
+                }}
+
+                return;
+            }}
+
+            renderMetadataTagChips(cardId);
+
+            var addInput = document.getElementById(
+                cardId + "-metadata-tag-add"
+            );
+
+            if (addInput) {{
+                addInput.focus();
+            }}
+        }}
+
+
+        function removeMetadataTag(cardId, tagToRemove) {{
+            var hiddenInput = document.getElementById(
+                cardId + "-metadata-tags"
+            );
+
+            if (!hiddenInput) {{
+                return;
+            }}
+
+            var removeKey = String(
+                tagToRemove || ""
+            ).toLocaleLowerCase();
+
+            var tags = parseMetadataTags(
+                hiddenInput.value
+            ).filter(function(tag) {{
+                return (
+                    tag.toLocaleLowerCase()
+                    !== removeKey
+                );
+            }});
+
+            setMetadataTags(cardId, tags);
+        }}
+
+
+        function initializeMetadataTagEditors() {{
+            var containers = document.querySelectorAll(
+                ".metadata-tag-chips[data-card-id]"
+            );
+
+            for (
+                var index = 0;
+                index < containers.length;
+                index++
+            ) {{
+                var cardId = containers[index]
+                    .getAttribute("data-card-id");
+
+                if (cardId) {{
+                    renderMetadataTagChips(cardId);
+                }}
+            }}
+        }}
+
+
+        function toggleMetadataEditor(cardId) {{
+            var editor = document.getElementById(
+                cardId + "-metadata-editor"
+            );
+
+            if (!editor) {{
+                return;
+            }}
+
+            if (editor.className.indexOf("hidden") !== -1) {{
+                editor.className = "metadata-editor";
+                renderMetadataTagChips(cardId);
+                return;
+            }}
+
+            editor.className = "metadata-editor hidden";
+        }}
+
+
+        function updateMetadataDisplay(cardId) {{
+            var titleInput = document.getElementById(
+                cardId + "-metadata-title"
+            );
+
+            var languageInput = document.getElementById(
+                cardId + "-metadata-language"
+            );
+
+            var seriesInput = document.getElementById(
+                cardId + "-metadata-series"
+            );
+
+            var seriesIndexInput = document.getElementById(
+                cardId + "-metadata-series-index"
+            );
+
+            var publishedAtInput = document.getElementById(
+                cardId + "-metadata-published-at"
+            );
+
+            var tagsInput = document.getElementById(
+                cardId + "-metadata-tags"
+            );
+
+            var titleDisplay = document.getElementById(
+                cardId + "-display-title"
+            );
+
+            var languageDisplay = document.getElementById(
+                cardId + "-display-language"
+            );
+
+            var seriesDisplay = document.getElementById(
+                cardId + "-display-series"
+            );
+
+            var seriesIndexDisplay = document.getElementById(
+                cardId + "-display-series-index"
+            );
+
+            var publishedAtDisplay = document.getElementById(
+                cardId + "-display-published-at"
+            );
+
+            var tagsDisplay = document.getElementById(
+                cardId + "-display-tags"
+            );
+
+            if (titleDisplay && titleInput) {{
+                titleDisplay.textContent = (
+                    titleInput.value.trim() || "-"
+                );
+            }}
+
+            if (languageDisplay && languageInput) {{
+                var selectedOption = (
+                    languageInput.options[
+                        languageInput.selectedIndex
+                    ]
+                );
+
+                languageDisplay.textContent = (
+                    selectedOption
+                    ? selectedOption.textContent.trim()
+                    : languageInput.value.trim()
+                );
+            }}
+
+            if (seriesDisplay && seriesInput) {{
+                seriesDisplay.textContent = (
+                    seriesInput.value.trim() || "-"
+                );
+            }}
+
+            if (seriesIndexDisplay && seriesIndexInput) {{
+                seriesIndexDisplay.textContent = (
+                    seriesIndexInput.value.trim() || "-"
+                );
+            }}
+
+            if (publishedAtDisplay && publishedAtInput) {{
+                publishedAtDisplay.textContent = (
+                    publishedAtInput.value.trim() || "-"
+                );
+            }}
+
+            if (tagsDisplay && tagsInput) {{
+                var tags = parseMetadataTags(
+                    tagsInput.value
+                );
+
+                tagsDisplay.textContent = (
+                    tags.length
+                    ? tags.join(", ")
+                    : "-"
+                );
+            }}
+        }}
+
+
+        function sendMetadataRequest(
+            cardId,
+            encodedPath,
+            action
+        ) {{
+            var result = document.getElementById(
+                cardId + "-metadata-result"
+            );
+
+            var title = document.getElementById(
+                cardId + "-metadata-title"
+            );
+
+            var author = document.getElementById(
+                cardId + "-metadata-author"
+            );
+
+            var language = document.getElementById(
+                cardId + "-metadata-language"
+            );
+
+            var series = document.getElementById(
+                cardId + "-metadata-series"
+            );
+
+            var seriesIndex = document.getElementById(
+                cardId + "-metadata-series-index"
+            );
+
+            var publishedAt = document.getElementById(
+                cardId + "-metadata-published-at"
+            );
+
+            commitPendingMetadataTags(cardId);
+
+            var tags = document.getElementById(
+                cardId + "-metadata-tags"
+            );
+
+            if (
+                !result
+                || !title
+                || !author
+                || !language
+                || !series
+                || !seriesIndex
+                || !publishedAt
+                || !tags
+            ) {{
+                return;
+            }}
+
+            result.className = "metadata-result";
+            result.textContent = (
+                action === "reset"
+                ? "복원 중..."
+                : "저장 중..."
+            );
+
+            var request = new XMLHttpRequest();
+
+            request.open(
+                "POST",
+                "/book-metadata",
+                true
+            );
+
+            request.setRequestHeader(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8"
+            );
+
+            request.onreadystatechange = function() {{
+                if (request.readyState !== 4) {{
+                    return;
+                }}
+
+                if (
+                    request.status >= 200
+                    && request.status < 300
+                ) {{
+                    result.textContent = (
+                        action === "reset"
+                        ? "복원됨"
+                        : "저장됨"
+                    );
+
+                    updateMetadataDisplay(cardId);
+
+                    if (action === "reset") {{
+                        window.setTimeout(function() {{
+                            window.location.reload();
+                        }}, 350);
+
+                        return;
+                    }}
+
+                    window.setTimeout(function() {{
+                        var editor = document.getElementById(
+                            cardId + "-metadata-editor"
+                        );
+
+                        if (editor) {{
+                            editor.classList.add("hidden");
+                        }}
+
+                        result.textContent = "";
+                    }}, 800);
+
+                    return;
+                }}
+
+                var message = "저장하지 못했습니다.";
+
+                try {{
+                    var response = JSON.parse(
+                        request.responseText
+                    );
+
+                    if (response.message) {{
+                        message = response.message;
+                    }}
+                }} catch (error) {{
+                    // 기본 오류 문구 사용
+                }}
+
+                result.className = "metadata-result error";
+                result.textContent = message;
+            }};
+
+            request.send(
+                "path=" + encodedPath
+                + "&action=" + encodeURIComponent(action)
+                + "&title=" + encodeURIComponent(title.value)
+                + "&author=" + encodeURIComponent(author.value)
+                + "&language=" + encodeURIComponent(language.value)
+                + "&series=" + encodeURIComponent(series.value)
+                + "&series_index="
+                + encodeURIComponent(seriesIndex.value)
+                + "&published_at="
+                + encodeURIComponent(publishedAt.value)
+                + "&tags="
+                + encodeURIComponent(tags.value)
+            );
+        }}
+
+
+        function saveBookMetadata(cardId, encodedPath) {{
+            sendMetadataRequest(
+                cardId,
+                encodedPath,
+                "save"
+            );
+        }}
+
+
+        function resetBookMetadata(cardId, encodedPath) {{
+            if (!window.confirm(
+                "수정값을 지우고 원본으로 복원할까요?"
+            )) {{
+                return;
+            }}
+
+            sendMetadataRequest(
+                cardId,
+                encodedPath,
+                "reset"
+            );
+        }}
+
+
+        function resizeSavedBookNote(noteInput) {{
+            if (!noteInput) {{
+                return;
+            }}
+
+            noteInput.rows = 1;
+            noteInput.style.height = "1px";
+            noteInput.style.height =
+                Math.max(32, noteInput.scrollHeight) + "px";
+        }}
+
+        function showBookNoteEditor(noteInput, button) {{
+            noteInput.className = "book-note-input";
+            noteInput.readOnly = false;
+            noteInput.rows = 4;
+            noteInput.style.height = "";
+            button.textContent = "저장";
+
+            noteInput.focus();
+
+            try {{
+                noteInput.setSelectionRange(
+                    noteInput.value.length,
+                    noteInput.value.length
+                );
+            }} catch (error) {{
+                // 구형 브라우저에서는 무시
+            }}
+        }}
+
+        function showSavedBookNote(noteInput, button) {{
+            noteInput.className = "book-note-input saved";
+            noteInput.readOnly = true;
+            button.textContent = "수정";
+            resizeSavedBookNote(noteInput);
+        }}
+
+        function showEmptyBookNote(noteInput, button) {{
+            noteInput.className = "book-note-input hidden";
+            noteInput.readOnly = false;
+            noteInput.rows = 4;
+            noteInput.style.height = "";
+            button.textContent = "메모 작성";
+        }}
+
+        function toggleBookNoteEditor(cardId, encodedPath) {{
+            var noteInput = document.getElementById(
+                cardId + "-note"
+            );
+            var button = document.getElementById(
+                cardId + "-note-button"
+            );
+            var resultElement = document.getElementById(
+                cardId + "-note-result"
+            );
+
+            if (!noteInput || !button) {{
+                return;
+            }}
+
+            if (resultElement) {{
+                resultElement.className = "book-note-result";
+                resultElement.textContent = "";
+            }}
+
+            if (
+                noteInput.className.indexOf("hidden") !== -1
+                || noteInput.readOnly
+            ) {{
+                showBookNoteEditor(noteInput, button);
+                return;
+            }}
+
+            saveBookNote(cardId, encodedPath);
+        }}
+
+        function saveBookNote(cardId, encodedPath) {{
+            var noteInput = document.getElementById(
+                cardId + "-note"
+            );
+            var resultElement = document.getElementById(
+                cardId + "-note-result"
+            );
+            var button = document.getElementById(
+                cardId + "-note-button"
+            );
+
+            if (!noteInput || !button) {{
+                return;
+            }}
+
+            var note = noteInput.value || "";
+            var request = new XMLHttpRequest();
+
+            button.disabled = true;
+            button.textContent = "저장 중";
+
+            if (resultElement) {{
+                resultElement.className = "book-note-result";
+                resultElement.textContent = "";
+            }}
+
+            request.open("POST", "/book-note", true);
+            request.setRequestHeader(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8"
+            );
+
+            request.onreadystatechange = function() {{
+                if (request.readyState !== 4) {{
+                    return;
+                }}
+
+                button.disabled = false;
+
+                var result = null;
+
+                try {{
+                    result = JSON.parse(request.responseText);
+                }} catch (error) {{
+                    result = null;
+                }}
+
+                if (
+                    request.status < 200
+                    || request.status >= 300
+                    || !result
+                    || result.status !== "ok"
+                ) {{
+                    button.textContent = "저장";
+
+                    if (resultElement) {{
+                        resultElement.className =
+                            "book-note-result error";
+                        resultElement.textContent =
+                            result && result.message
+                            ? result.message
+                            : "저장 실패";
+                    }}
+
+                    return;
+                }}
+
+                noteInput.value = result.note || "";
+
+                if (noteInput.value.trim()) {{
+                    showSavedBookNote(noteInput, button);
+                }} else {{
+                    showEmptyBookNote(noteInput, button);
+                }}
+
+                if (resultElement) {{
+                    resultElement.className = "book-note-result";
+                    resultElement.textContent = "저장됨";
+                }}
+
+                window.setTimeout(function() {{
+                    if (
+                        resultElement
+                        && resultElement.textContent === "저장됨"
+                    ) {{
+                        resultElement.textContent = "";
+                    }}
+                }}, 1600);
+            }};
+
+            request.send(
+                "path=" + encodedPath
+                + "&note=" + encodeURIComponent(note)
+            );
+        }}
+
+        (function () {{
+            var savedNotes = document.querySelectorAll(
+                ".book-note-input.saved"
+            );
+
+            for (var i = 0; i < savedNotes.length; i++) {{
+                resizeSavedBookNote(savedNotes[i]);
+            }}
+        }})();
+
+        function setReadingStatus(cardId, url, status) {{
+            var badge = document.getElementById(
+                cardId + '-reading-status'
+            );
+            var finishedAtElement = document.getElementById(
+                cardId + '-finished-at'
+            );
+            var card = document.getElementById(
+                cardId + '-download'
+            );
+
+            if (card) {{
+                card = card.closest
+                    ? card.closest(".book-card")
+                    : card.parentNode.parentNode;
+            }}
+
+            var request = new XMLHttpRequest();
+            var separator = url.indexOf('?') === -1 ? '?' : '&';
+
+            request.open(
+                'GET',
+                url + separator + 'ajax=1',
+                true
+            );
+
+            request.onreadystatechange = function() {{
+                if (request.readyState !== 4) {{
+                    return;
+                }}
+
+                if (request.status < 200 || request.status >= 300) {{
+                    alert('독서 상태를 저장하지 못했습니다.');
+                    return;
+                }}
+
+                var result;
+
+                try {{
+                    result = JSON.parse(request.responseText);
+                }} catch (error) {{
+                    alert('독서 상태 응답을 읽지 못했습니다.');
+                    return;
+                }}
+
+                if (card) {{
+                    card.setAttribute(
+                        "data-reading-status",
+                        status
+                    );
+                }}
+
+                if (!badge && card) {{
+                    var cardActions = card.querySelector(
+                        ".card-actions"
+                    );
+
+                    if (cardActions) {{
+                        badge = document.createElement("span");
+                        badge.id = cardId + "-reading-status";
+                        badge.className = "reading-status";
+                        cardActions.appendChild(badge);
+                    }}
+                }}
+
+                if (!badge) {{
+                    applyBookFilters();
+                    return;
+                }}
+
+                if (status === 'finished') {{
+                    var finishedAt = result.finished_at || '';
+                    var label = '✓ 완독';
+
+                    if (finishedAt) {{
+                        label += ' · ' + finishedAt;
+                    }}
+
+                    badge.className = 'reading-status finished';
+
+                    if (finishedAt) {{
+                        badge.textContent = '✓ 완독 · ' + finishedAt.slice(5);
+                    }} else {{
+                        badge.textContent = '✓ 완독';
+                    }}
+
+                    if (finishedAtElement) {{
+                        finishedAtElement.textContent = finishedAt || '-';
+                    }}
+                }} else {{
+                    badge.className = 'reading-status unread';
+                    badge.textContent = '미독';
+
+                    if (finishedAtElement) {{
+                        finishedAtElement.textContent = '-';
+                    }}
+                }}
+
+                applyBookFilters();
+            }};
+
+            request.send(null);
+            return false;
+        }}
+
+        function startDownload(cardId, downloadPath, filename) {{
+            var token = makeToken();
+            var progressBox = document.getElementById(
+                cardId + "-progress"
+            );
+            var bar = document.getElementById(cardId + "-bar");
+            var text = document.getElementById(cardId + "-text");
+            var percent = document.getElementById(
+                cardId + "-percent"
+            );
+            var frame = document.getElementById("downloadFrame");
+            var cancelButton = document.getElementById(
+                cardId + "-cancel"
+            );
+            var downloadButton = document.getElementById(
+                cardId + "-download"
+            );
+
+            activeDownloads[cardId] = token;
+
+            if (downloadButton) {{
+                downloadButton.textContent = "받는 중";
+                downloadButton.disabled = true;
+            }}
+            cancelButton.className = "cancel-button";
+
+            progressBox.className = "progress-area";
+            bar.style.width = "0%";
+            text.textContent = "다운로드 연결 중: " + filename;
+            percent.textContent = "0%";
+
+            frame.src =
+                downloadPath
+                + "?id="
+                + encodeURIComponent(token)
+                + "&t="
+                + Date.now();
+
+            pollProgress(
+                cardId,
+                token,
+                bar,
+                text,
+                percent,
+                0
+            );
+        }}
+
+        function cancelDownload(cardId) {{
+            var token = activeDownloads[cardId];
+
+            if (!token) {{
+                return;
+            }}
+
+            var frame = document.getElementById("downloadFrame");
+            var progressBox = document.getElementById(
+                cardId + "-progress"
+            );
+            var bar = document.getElementById(cardId + "-bar");
+            var text = document.getElementById(cardId + "-text");
+            var percent = document.getElementById(
+                cardId + "-percent"
+            );
+            var cancelButton = document.getElementById(
+                cardId + "-cancel"
+            );
+            var downloadButton = document.getElementById(
+                cardId + "-download"
+            );
+
+            var request = new XMLHttpRequest();
+
+            request.open(
+                "GET",
+                "/cancel?id="
+                    + encodeURIComponent(token)
+                    + "&t="
+                    + Date.now(),
+                true
+            );
+
+            request.send(null);
+
+            frame.src = "about:blank";
+
+            if (progressBox) {{
+                progressBox.className = "progress-area hidden";
+            }}
+
+            if (bar) {{
+                bar.style.width = "0%";
+            }}
+
+            if (text) {{
+                text.textContent = "다운로드 준비 중";
+            }}
+
+            if (percent) {{
+                percent.textContent = "0%";
+            }}
+
+            if (cancelButton) {{
+                cancelButton.className = "cancel-button hidden";
+            }}
+
+            if (downloadButton) {{
+                downloadButton.textContent = "받기";
+                downloadButton.disabled = false;
+            }}
+
+            delete activeDownloads[cardId];
+        }}
+
+        function pollProgress(
+            cardId,
+            token,
+            bar,
+            text,
+            percent,
+            misses
+        ) {{
+            var request = new XMLHttpRequest();
+
+            request.open(
+                "GET",
+                "/progress?id="
+                    + encodeURIComponent(token)
+                    + "&t="
+                    + Date.now(),
+                true
+            );
+
+            request.onreadystatechange = function () {{
+                if (request.readyState !== 4) {{
+                    return;
+                }}
+
+                if (request.status !== 200) {{
+                    if (misses < 20) {{
+                        setTimeout(function () {{
+                            pollProgress(
+                                cardId,
+                                token,
+                                bar,
+                                text,
+                                percent,
+                                misses + 1
+                            );
+                        }}, 700);
+                    }} else {{
+                        text.textContent = "진행 상태를 확인할 수 없습니다";
+                    }}
+
+                    return;
+                }}
+
+                var data;
+
+                try {{
+                    data = JSON.parse(request.responseText);
+                }} catch (error) {{
+                    text.textContent = "진행 정보 해석 오류";
+                    return;
+                }}
+
+                var value = data.percent || 0;
+
+                bar.style.width = value + "%";
+                percent.textContent = value + "%";
+
+                if (data.total > 0) {{
+                    text.textContent =
+                        data.sent_text
+                        + " / "
+                        + data.total_text
+                        + " · "
+                        + data.message;
+                }} else {{
+                    text.textContent = data.message;
+                }}
+
+                if (data.status === "complete") {{
+                    var progressBox = document.getElementById(
+                        cardId + "-progress"
+                    );
+                    var downloadButton = document.getElementById(
+                        cardId + "-download"
+                    );
+
+                    document.getElementById(
+                        cardId + "-cancel"
+                    ).className = "cancel-button hidden";
+
+                    if (progressBox) {{
+                        progressBox.className = "progress-area hidden";
+                    }}
+
+                    if (downloadButton) {{
+                        downloadButton.textContent = "완료";
+                        downloadButton.disabled = false;
+                    }}
+
+                    delete activeDownloads[cardId];
+                    return;
+                }}
+
+                if (data.status === "cancelled") {{
+                    bar.style.width = "0%";
+                    percent.textContent = "취소";
+                    text.textContent = data.message;
+
+                    document.getElementById(
+                        cardId + "-cancel"
+                    ).className = "cancel-button hidden";
+
+                    delete activeDownloads[cardId];
+                    return;
+                }}
+
+                if (data.status === "error") {{
+                    return;
+                }}
+
+                if (data.status === "interrupted") {{
+                    text.textContent =
+                        data.sent_text
+                        + " / "
+                        + data.total_text
+                        + " · 연결 끊김 또는 재시도 중";
+                }}
+
+                setTimeout(function () {{
+                    pollProgress(
+                        cardId,
+                        token,
+                        bar,
+                        text,
+                        percent,
+                        0
+                    );
+                }}, 500);
+            }};
+
+            request.send(null);
+        }}
+    </script>
+
+    <script>
+        function openHistoryModal() {{
+            const modal = document.getElementById("historyModal");
+
+            if (modal) {{
+                modal.classList.remove("hidden");
+                document.body.style.overflow = "hidden";
+            }}
+        }}
+
+        function closeHistoryModal(event) {{
+            if (
+                event &&
+                event.target &&
+                event.target.id !== "historyModal"
+            ) {{
+                return;
+            }}
+
+            const modal = document.getElementById("historyModal");
+
+            if (modal) {{
+                modal.classList.add("hidden");
+                document.body.style.overflow = "";
+            }}
+        }}
+
+        document.addEventListener("keydown", function(event) {{
+            if (event.key === "Escape") {{
+                closeHistoryModal();
+            }}
+        }});
+    </script>
+
+</body>
+</html>
+"""
+
+        encoded = body.encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        return BytesIO(encoded)
+
+    def log_message(self, fmt, *args):
+        print(
+            f"[BOOK] {self.client_address[0]} - {fmt % args}"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Termux 개인 전자책 서버"
+    )
+
+    parser.add_argument(
+        "--directory",
+        default=os.path.expanduser(
+            "~/storage/shared/Mine/Books"
+        ),
+    )
+    parser.add_argument("--port", type=int, default=8083)
+    parser.add_argument("--bind", default="0.0.0.0")
+
+    args = parser.parse_args()
+
+    directory = os.path.abspath(
+        os.path.expanduser(args.directory)
+    )
+
+    if not os.path.isdir(directory):
+        raise SystemExit(
+            f"[ERROR] Books 폴더가 없습니다: {directory}"
+        )
+
+    def handler_factory(*handler_args, **handler_kwargs):
+        return BookHandler(
+            *handler_args,
+            directory=directory,
+            **handler_kwargs,
+        )
+
+    server = ThreadingHTTPServer(
+        (args.bind, args.port),
+        handler_factory,
+    )
+
+    server.daemon_threads = True
+    server.allow_reuse_address = True
+
+    print(f"[BOOK] 폴더: {directory}")
+    print(f"[BOOK] 포트: {args.port}")
+    print("[BOOK] 주소: http://192.168.219.126:8083/")
+    print("[BOOK] 종료: Ctrl+C")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[BOOK] 서버 종료")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
